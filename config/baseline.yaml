@@ -1,0 +1,44 @@
+experiment:
+  name: baseline
+  prompt: remove degradation
+
+paths:
+  lq_dir: /home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/LQ_RaindropRemoval_WeatherRemoval_iter45000
+  gt_dir: /home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/GT
+  prior_dir: /home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen2.5-VL-7B/P_int
+  json_dir: /home/student_1/LoViF/FUMO/json
+  output_dir: /home/student_1/LoViF/FUMO/outputs
+
+split:
+  type: gt_based
+  val_ratio: 0.05
+  seed: 42
+
+sampling:
+  strategy: all_lq
+
+stage1:
+  pretrained_model_name_or_path: Manojb/stable-diffusion-2-1-base
+  resolution: 768
+  train_batch_size: 1
+  gradient_accumulation_steps: 2
+  learning_rate: 5.0e-5
+  max_train_steps: 20000
+  checkpointing_steps: 2000
+  log_interval: 100
+  checkpoints_total_limit: 5
+  validation_steps: 1000
+  num_validation_images: 1
+  validation_example_index: 0
+  dataloader_num_workers: 4
+  mixed_precision: bf16
+  report_to: none
+  tracker_project_name: fumo_baseline
+  lr_scheduler: constant
+  lr_warmup_steps: 0
+  beta_max: 0.25
+  beta_warmup_ratio: 0.1
+  shrink_prob: 0.1
+  seed: 42
+  enable_xformers_memory_efficient_attention: false
+  gradient_checkpointing: true

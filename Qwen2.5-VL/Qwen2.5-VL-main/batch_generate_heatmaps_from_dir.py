@@ -8,7 +8,7 @@ from PIL import Image
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 import re
 import multiprocessing
 from typing import List
@@ -24,13 +24,13 @@ except ImportError:
 # =========================
 # Config (edit as needed)
 # =========================
-INPUT_DIR = "/home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/LQ_reflection_only"
-OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_reflection_only/P_int"
-GRAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_reflection_only/P_int_gray"
-HEATMAP_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_reflection_only/P_int_heatmap"
-OVERLAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_reflection_only/P_int_overlay"
+INPUT_DIR = "/home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/LQ_RaindropRemoval_WeatherRemoval_iter45000"
+OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int"
+GRAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int_gray"
+HEATMAP_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int_heatmap"
+OVERLAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int_overlay"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-MODEL_PATH = "../Qwen2.5-VL-7B"
+MODEL_PATH = "../Qwen3-VL-8B-Instruct"
 
 # Save visualization PNGs for generated and existing npy priors.
 SAVE_GRAY_PNG = True
@@ -40,6 +40,7 @@ VISUALIZE_EXISTING_NPY = True
 GENERATE_MISSING_NPY = True
 HEATMAP_COLORMAP = cv2.COLORMAP_TURBO
 OVERLAY_ALPHA = 0.35
+MAX_WORKERS = None
 
 # --- heatmap params ---
 BOOST_FACTOR = 1.5
@@ -162,9 +163,9 @@ def choose_patch_params(h, w):
     if max_side > 1900:
         return "nonscale", 200, 1.0
     elif 1000 < max_side <= 1900:
-        return "nonscale", 170, 1.0
+        return "nonscale", 120, 1.0
     elif 750 < max_side <= 1000:
-        return "nonscale", 130, 1.0
+        return "nonscale", 100, 1.0
     else:
         return "nonscale", 80, 1.0
 
@@ -303,9 +304,11 @@ def worker(tasks, device_id, tokenizer):
     print(f"Worker started on device {device}")
 
     try:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            MODEL_PATH, torch_dtype=torch.float16
-        ).to(device)
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            MODEL_PATH,
+            dtype="auto",
+            device_map={"": device},
+        )
         processor = AutoProcessor.from_pretrained(MODEL_PATH)
         candidate_ids = get_candidate_ids(tokenizer)
         print(f"Model loaded on {device}")
@@ -325,7 +328,9 @@ def main():
     if num_gpus == 0:
         print("Error: no CUDA devices found.")
         return
-    print(f"Found {num_gpus} GPU(s).")
+    if MAX_WORKERS is not None:
+        num_gpus = min(num_gpus, MAX_WORKERS)
+    print(f"Using {num_gpus} worker(s).")
 
     input_dir = os.path.abspath(INPUT_DIR)
     if not os.path.isdir(input_dir):

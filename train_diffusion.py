@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # coding=utf-8
 # Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 #
@@ -35,7 +35,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
@@ -79,6 +79,33 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
+def labeled_image_grid(imgs, labels):
+    assert len(imgs) == len(labels)
+
+    w, h = imgs[0].size
+    label_height = max(36, h // 18)
+    grid = Image.new("RGB", size=(len(imgs) * w, h + label_height), color="white")
+
+    for i, img in enumerate(imgs):
+        grid.paste(img, box=(i * w, 0))
+
+    draw = ImageDraw.Draw(grid)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", size=max(18, w // 36))
+    except OSError:
+        font = ImageFont.load_default()
+
+    for i, label in enumerate(labels):
+        bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        x = i * w + (w - text_w) // 2
+        y = h + (label_height - text_h) // 2
+        draw.text((x, y), label, fill="black", font=font)
+
+    return grid
+
+
 def compute_beta(global_step: int, max_steps: int, warmup_ratio: float, beta_max: float) -> float:
     if max_steps <= 0:
         return beta_max
@@ -97,10 +124,156 @@ def compute_hf_mag(image: torch.Tensor) -> torch.Tensor:
     return hf_mag
 
 
+FINAL_SCORE_SSIM_WEIGHT = 10.0
+FINAL_SCORE_LPIPS_WEIGHT = 5.0
+
+
+def final_score(psnr_value: float, ssim_value: float, lpips_value: float) -> float:
+    return psnr_value + FINAL_SCORE_SSIM_WEIGHT * ssim_value - FINAL_SCORE_LPIPS_WEIGHT * lpips_value
+
+
+def rgb_to_y_tensor(image: torch.Tensor) -> torch.Tensor:
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+    if image.shape[1] == 1:
+        return image
+    if image.shape[1] != 3:
+        raise ValueError(f"Expected 1 or 3 channels, got {image.shape[1]}.")
+    r = image[:, 0:1]
+    g = image[:, 1:2]
+    b = image[:, 2:3]
+    return 0.256789 * r + 0.504129 * g + 0.097906 * b + 16.0 / 255.0
+
+
+def build_lpips_metric(device: torch.device):
+    import lpips
+
+    metric = lpips.LPIPS(net="alex").to(device)
+    metric.eval()
+    for parameter in metric.parameters():
+        parameter.requires_grad_(False)
+    return metric
+
+
+def calculate_validation_metrics(pred: torch.Tensor, target: torch.Tensor, lpips_metric) -> dict:
+    pred = pred.clamp(0.0, 1.0)
+    target = target.to(device=pred.device, dtype=pred.dtype).clamp(0.0, 1.0)
+    pred_y = rgb_to_y_tensor(pred)
+    target_y = rgb_to_y_tensor(target)
+    mse = (pred_y - target_y).pow(2).flatten(1).mean(dim=1).clamp(min=1e-12)
+    psnr_value = (20.0 * torch.log10(1.0 / torch.sqrt(mse))).mean().item()
+
+    from utils.loss_utils import ssim
+
+    ssim_value = ssim(pred_y, target_y).item()
+    with torch.no_grad():
+        lpips_value = lpips_metric(pred * 2.0 - 1.0, target * 2.0 - 1.0).mean().item()
+
+    return {
+        "psnr": psnr_value,
+        "ssim": ssim_value,
+        "lpips": lpips_value,
+        "final_score": final_score(psnr_value, ssim_value, lpips_value),
+    }
+
+
+def save_stage1_best_model(controlnet, unet, accelerator, output_dir: str, step: int, metrics: dict) -> None:
+    best_dir = Path(output_dir) / "best"
+    controlnet_dir = best_dir / "controlnet"
+    unet_dir = best_dir / "unet"
+    best_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.unwrap_model(controlnet).save_pretrained(controlnet_dir)
+    accelerator.unwrap_model(unet).save_pretrained(unet_dir)
+    payload = {"step": step, **{key: float(value) for key, value in metrics.items()}}
+    with open(best_dir / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def create_training_history() -> dict:
+    return {"train": [], "validation": []}
+
+
+def update_training_history(history: dict, split: str, step: int, values: dict) -> None:
+    payload = {"step": int(step)}
+    payload.update({key: float(value) for key, value in values.items() if value is not None})
+    history.setdefault(split, []).append(payload)
+
+
+def save_training_history(history: dict, output_dir: str) -> None:
+    log_dir = Path(output_dir) / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logger.warning("Skipping history plot because matplotlib is unavailable: %s", exc)
+        return
+
+    metrics = ["loss", "psnr", "ssim", "lpips", "final_score"]
+    for metric in metrics:
+        metric_fig, metric_axis = plt.subplots(figsize=(8, 4.5))
+        metric_has_data = _plot_metric(metric_axis, history, metric)
+        metric_axis.set_title(metric)
+        metric_axis.set_xlabel("step")
+        metric_axis.set_ylabel(metric)
+        metric_axis.grid(True, alpha=0.3)
+        if metric_has_data:
+            metric_axis.legend(loc="best")
+        metric_fig.tight_layout()
+        metric_fig.savefig(log_dir / f"{metric}.png", dpi=160)
+        plt.close(metric_fig)
+
+
+def _plot_metric(axis, history: dict, metric: str) -> bool:
+    has_data = False
+    for split, entries in history.items():
+        xs = [entry["step"] for entry in entries if metric in entry]
+        ys = [entry[metric] for entry in entries if metric in entry]
+        if xs:
+            axis.plot(xs, ys, marker="o", linewidth=1.2, markersize=2.5, label=split)
+            has_data = True
+    return has_data
+
+
+def setup_rank0_file_logging(output_dir: str) -> None:
+    log_dir = Path(output_dir) / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "train.log"
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_path:
+            return
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
+    root_logger.addHandler(file_handler)
+    base_logger = getattr(logger, "logger", None)
+    if base_logger is not None:
+        base_logger.addHandler(file_handler)
+
+
+def save_validation_examples(image_logs: list, output_dir: str, step: int) -> None:
+    if not image_logs:
+        return
+    image_dir = Path(output_dir) / "validation_images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    log = image_logs[0]
+    images = [log["validation_image"]] + log["images"] + [log["gt_image"]]
+    labels = ["LQ"] + ["prediction" if len(log["images"]) == 1 else f"prediction {idx + 1}" for idx in range(len(log["images"]))] + ["GT"]
+    grid = labeled_image_grid(images, labels)
+    grid.save(image_dir / f"step_{int(step):06d}.png")
+
+
 def log_validation(
     vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False
 ):
     logger.info("Running validation... ")
+
+    if args.validation_jsonl is None:
+        logger.warning("Skipping validation because --validation_jsonl is not set.")
+        return {"image_logs": [], "metrics": None}
 
     if not is_final_validation:
         controlnet = accelerator.unwrap_model(controlnet)
@@ -111,7 +284,11 @@ def log_validation(
         )
         unet = UNet2DConditionModel.from_pretrained(
             os.path.join(args.output_dir, "unet"), torch_dtype=weight_dtype
-        ) 
+        )
+
+    if is_final_validation:
+        controlnet = controlnet.to(accelerator.device, dtype=weight_dtype)
+        unet = unet.to(accelerator.device, dtype=weight_dtype)
 
     pipeline = OneStepPipeline(
         vae=vae,
@@ -123,79 +300,104 @@ def log_validation(
         scheduler=None,
         feature_extractor=None,
         t_start=0,
-    )
+    ).to(accelerator.device)
 
-    from utils.loss_utils import ssim
-    # from lpipsPyTorch import lpips
-    from utils.image_utils import psnr
     from torchvision.transforms import ToTensor
 
-    total_ssim = []
-    total_psnr = []
-    total_lpips = []
+    metric_sums = {"psnr": 0.0, "ssim": 0.0, "lpips": 0.0, "final_score": 0.0}
     count = 0
-
     image_logs = []
     inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
+    lpips_metric = build_lpips_metric(accelerator.device)
+    beta = compute_beta(step, args.max_train_steps, args.beta_warmup_ratio, args.beta_max)
 
-    with open(args.validation_jsonl, 'r') as f:
-        validation_data = [json.loads(line) for line in f]
+    with open(args.validation_jsonl, "r", encoding="utf-8") as f:
+        validation_data = [json.loads(line) for line in f if line.strip()]
 
-    data_num = len(validation_data)
-    save_id = random.randint(1, data_num)
+    if not validation_data:
+        raise ValueError(f"Validation jsonl is empty: {args.validation_jsonl}")
 
-    for data in validation_data:
-        validation_image = data['conditioning_image']
-        validation_prompt = data['text']
-        gt_image_path = data['image']
-        
-        validation_image = Image.open(validation_image).convert("RGB")
+    save_idx = min(max(args.validation_example_index, 0), len(validation_data) - 1)
+    if save_idx != args.validation_example_index:
+        logger.warning(
+            "validation_example_index %d is out of range for %d rows. Using %d instead.",
+            args.validation_example_index,
+            len(validation_data),
+            save_idx,
+        )
+
+    validation_iter = tqdm(
+        validation_data,
+        desc=f"Validation step {step}",
+        disable=not accelerator.is_main_process,
+        leave=True,
+    )
+
+    for row_idx, data in enumerate(validation_iter):
+        validation_image_path = data["conditioning_image"]
+        validation_prompt = data.get("text", "remove degradation")
+        gt_image_path = data["image"]
+        prior_path = data.get("prior")
+
+        validation_image = Image.open(validation_image_path).convert("RGB")
         gt_image = Image.open(gt_image_path).convert("RGB")
+        prior = np.load(prior_path) if prior_path else None
 
         images = []
         with inference_ctx:
             for _ in range(args.num_validation_images):
                 generated_image = pipeline(
                     image=validation_image,
-                    prompt="remove glass reflection",
+                    prompt=validation_prompt,
+                    prior=prior,
+                    beta=beta,
+                    processing_resolution=args.resolution,
                 ).prediction[0]
 
                 generated_image = (generated_image + 1) / 2
-                generated_image = generated_image.clip(0., 1.)
+                generated_image = generated_image.clip(0.0, 1.0)
                 generated_image = (generated_image * 255).astype(np.uint8)
                 generated_image = Image.fromarray(generated_image)
                 images.append(generated_image)
 
-                gen_tensor = ToTensor()(generated_image).unsqueeze(0).cuda()
-                gt_tensor = ToTensor()(gt_image).unsqueeze(0).cuda()
+                gen_tensor = ToTensor()(generated_image).unsqueeze(0).to(accelerator.device)
+                gt_tensor = ToTensor()(gt_image).unsqueeze(0).to(accelerator.device)
 
                 if gen_tensor.shape[-2:] != gt_tensor.shape[-2:]:
-                    gen_tensor = torch.nn.functional.interpolate(gen_tensor, size=gt_tensor.shape[-2:], mode='bilinear')
+                    gen_tensor = torch.nn.functional.interpolate(
+                        gen_tensor,
+                        size=gt_tensor.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
 
-                total_ssim.append(ssim(gen_tensor, gt_tensor))
-                total_psnr.append(psnr(gen_tensor, gt_tensor))
-                # total_lpips.append(lpips(gen_tensor, gt_tensor, net_type='vgg'))
+                metrics = calculate_validation_metrics(gen_tensor, gt_tensor, lpips_metric)
+                for key, value in metrics.items():
+                    metric_sums[key] += value
                 count += 1
 
-        if count == save_id:
+        if row_idx == save_idx:
             image_logs.append({
                 "validation_image": validation_image,
                 "images": images,
                 "gt_image": gt_image,
-                "validation_prompt": validation_prompt
+                "validation_prompt": validation_prompt,
             })
 
-    avg_ssim = torch.tensor(total_ssim).mean().item()
-    avg_psnr = torch.tensor(total_psnr).mean().item()
-    # avg_lpips = torch.tensor(total_lpips).mean().item()
-
-    # logger.info(f"Validation Metrics [Avg] - SSIM: {avg_ssim:.4f}, PSNR: {avg_psnr:.4f}, LPIPS: {avg_lpips:.4f}")
-    logger.info(f"Validation Metrics [Avg] - SSIM: {avg_ssim:.4f}, PSNR: {avg_psnr:.4f}")
+    avg_metrics = {key: value / count for key, value in metric_sums.items()}
+    logger.info(
+        "Validation Metrics [Avg] - PSNR: %.4f, SSIM: %.4f, LPIPS: %.4f, Final: %.4f",
+        avg_metrics["psnr"],
+        avg_metrics["ssim"],
+        avg_metrics["lpips"],
+        avg_metrics["final_score"],
+    )
 
     accelerator.log({
-        "validation/ssim": avg_ssim,
-        "validation/psnr": avg_psnr,
-        # "validation/lpips": avg_lpips,
+        "validation/psnr": avg_metrics["psnr"],
+        "validation/ssim": avg_metrics["ssim"],
+        "validation/lpips": avg_metrics["lpips"],
+        "validation/final_score": avg_metrics["final_score"],
     }, step=step)
 
     tracker_key = "test" if is_final_validation else "validation"
@@ -207,8 +409,7 @@ def log_validation(
                 validation_image = log["validation_image"]
                 gt_image = log["gt_image"]
 
-                formatted_images = []
-                formatted_images.append(np.asarray(validation_image))
+                formatted_images = [np.asarray(validation_image)]
                 for image in images:
                     formatted_images.append(np.asarray(image))
                 formatted_images.append(np.asarray(gt_image))
@@ -225,11 +426,11 @@ def log_validation(
                     formatted_images.append(wandb.Image(image, caption=validation_prompt))
             tracker.log({tracker_key: formatted_images})
 
-    del pipeline
+    del pipeline, lpips_metric
     gc.collect()
     torch.cuda.empty_cache()
 
-    return image_logs
+    return {"image_logs": image_logs, "metrics": avg_metrics}
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
@@ -372,6 +573,12 @@ def parse_args(input_args=None):
             "See https://huggingface.co/docs/diffusers/main/en/training/dreambooth#performing-inference-using-a-saved-checkpoint for step by step"
             "instructions."
         ),
+    )
+    parser.add_argument(
+        "--log_interval",
+        type=int,
+        default=50,
+        help="Save train loss history and plot every X optimizer steps.",
     )
     parser.add_argument(
         "--checkpoints_total_limit",
@@ -624,6 +831,12 @@ def parse_args(input_args=None):
         help="Number of images to be generated for each `--validation_image`, `--validation_prompt` pair",
     )
     parser.add_argument(
+        "--validation_example_index",
+        type=int,
+        default=0,
+        help="Zero-based validation JSONL row index used for the saved comparison image at every validation step.",
+    )
+    parser.add_argument(
         "--validation_steps",
         type=int,
         default=100,
@@ -704,15 +917,16 @@ def parse_args(input_args=None):
     return args
 
 class FuseDataset(torch.utils.data.Dataset):
-    def __init__(self, datasets, probabilities):
+    def __init__(self, datasets, probabilities, train_args):
         self.datasets = datasets
         self.probabilities = probabilities
         self.cumulative_probabilities = np.cumsum(probabilities)
+        self.args = train_args
 
         self.resize_transform = transforms.Resize(
-            args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
+            self.args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
         )
-        if args.disable_augment:
+        if self.args.disable_augment:
             self.image_transforms = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
@@ -722,7 +936,7 @@ class FuseDataset(torch.utils.data.Dataset):
             ])
         else:
             self.image_transforms = transforms.Compose([
-                transforms.RandomCrop(args.resolution),
+                transforms.RandomCrop(self.args.resolution),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
@@ -730,7 +944,7 @@ class FuseDataset(torch.utils.data.Dataset):
                 transforms.Normalize([0.5], [0.5]),
             ])
             self.prior_transforms = transforms.Compose([
-                transforms.RandomCrop(args.resolution),
+                transforms.RandomCrop(self.args.resolution),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
                 transforms.ToTensor(),
@@ -824,7 +1038,7 @@ def make_train_dataset(args, tokenizer, accelerator):
             train_dataset = dataset.with_transform(preprocess_train)
             train_datasets.append(train_dataset)
 
-    return FuseDataset(train_datasets, args.multiple_datasets_probabilities)
+    return FuseDataset(train_datasets, args.multiple_datasets_probabilities, args)
 
 def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -852,6 +1066,8 @@ def main(args):
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
             " Please use `huggingface-cli login` to authenticate with the Hub."
         )
+    if args.report_to is not None and args.report_to.lower() in {"none", "null", "false"}:
+        args.report_to = None
 
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -1091,6 +1307,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
+        setup_rank0_file_logging(args.output_dir)
         tracker_config = dict(vars(args))
 
         # tensorboard cannot handle list types for config
@@ -1100,7 +1317,8 @@ def main(args):
         tracker_config.pop("multiple_datasets")
         tracker_config.pop("multiple_datasets_probabilities")
 
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        if args.report_to is not None:
+            accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1154,6 +1372,8 @@ def main(args):
     )
 
     image_logs = None
+    best_validation_score = -float("inf")
+    history = create_training_history()
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet, unet):
@@ -1278,8 +1498,8 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        image_logs = log_validation(
+                    if args.validation_jsonl is not None and global_step % args.validation_steps == 0:
+                        validation_output = log_validation(
                             vae,
                             text_encoder,
                             tokenizer,
@@ -1290,10 +1510,33 @@ def main(args):
                             weight_dtype,
                             global_step,
                         )
+                        image_logs = validation_output["image_logs"]
+                        metrics = validation_output["metrics"]
+                        save_validation_examples(image_logs, args.output_dir, global_step)
+                        if metrics is not None:
+                            update_training_history(history, "validation", global_step, metrics)
+                            save_training_history(history, args.output_dir)
+                        if metrics is not None and metrics["final_score"] > best_validation_score:
+                            best_validation_score = metrics["final_score"]
+                            logger.info("New best final_score: %.4f. Saving best Stage 1 modules...", best_validation_score)
+                            save_stage1_best_model(controlnet, unet, accelerator, args.output_dir, global_step, metrics)
+
+                if args.validation_jsonl is not None and global_step % args.validation_steps == 0:
+                    accelerator.wait_for_everyone()
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+            if accelerator.is_main_process and global_step % args.log_interval == 0:
+                update_training_history(history, "train", global_step, logs)
+                save_training_history(history, args.output_dir)
+                logger.info(
+                    "Iteration [%d/%d] Loss: %.6f LR: %.8f",
+                    global_step,
+                    args.max_train_steps,
+                    logs["loss"],
+                    logs["lr"],
+                )
 
             if global_step >= args.max_train_steps:
                 break
@@ -1308,8 +1551,8 @@ def main(args):
 
         # Run a final round of validation.
         image_logs = None
-        if args.validation_prompt is not None:
-            image_logs = log_validation(
+        if args.validation_jsonl is not None:
+            validation_output = log_validation(
                 vae=vae,
                 text_encoder=text_encoder,
                 tokenizer=tokenizer,
@@ -1321,6 +1564,16 @@ def main(args):
                 step=global_step,
                 is_final_validation=True,
             )
+            image_logs = validation_output["image_logs"]
+            metrics = validation_output["metrics"]
+            save_validation_examples(image_logs, args.output_dir, global_step)
+            if metrics is not None:
+                update_training_history(history, "validation", global_step, metrics)
+                save_training_history(history, args.output_dir)
+            if metrics is not None and metrics["final_score"] > best_validation_score:
+                best_validation_score = metrics["final_score"]
+                logger.info("New best final_score: %.4f. Saving best Stage 1 modules...", best_validation_score)
+                save_stage1_best_model(controlnet, unet, accelerator, args.output_dir, global_step, metrics)
 
         if args.push_to_hub:
             save_model_card(

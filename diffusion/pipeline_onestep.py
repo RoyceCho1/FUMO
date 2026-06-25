@@ -20,8 +20,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from tqdm.auto import tqdm
+
+from wavelet_color_fix import wavelet_decomposition
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
 
@@ -343,6 +346,8 @@ class OneStepPipeline(StableDiffusionControlNetPipeline):
         num_images_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+        prior: Optional[Union[np.ndarray, torch.Tensor, Image.Image]] = None,
+        beta: float = 0.0,
         output_type: str = "np",
         output_uncertainty: bool = False,
         output_latent: bool = False,
@@ -457,6 +462,11 @@ class OneStepPipeline(StableDiffusionControlNetPipeline):
 
 
         # 3. prepare prompt
+        if prompt is not None and prompt != self.prompt:
+            self.prompt = prompt
+            self.prompt_embeds = None
+            self.negative_prompt_embeds = None
+
         if self.prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 self.prompt,
@@ -488,6 +498,21 @@ class OneStepPipeline(StableDiffusionControlNetPipeline):
         else:
             padding = (0, 0)
             original_resolution = image.shape[2:]
+
+        prior_tensor = None
+        hf_mag = None
+        if prior is not None and beta > 0.0:
+            prior_tensor = self._prepare_prior_tensor(
+                prior,
+                image.shape[-2:],
+                device,
+                dtype,
+                image.shape[0],
+            )
+            hf_mag = self._compute_hf_mag(image)
+            if ensemble_size > 1:
+                prior_tensor = prior_tensor.repeat_interleave(ensemble_size, dim=0)
+                hf_mag = hf_mag.repeat_interleave(ensemble_size, dim=0)
         # 5. Encode input image into latent space. At this step, each of the `N` input images is represented with `E`
         # ensemble members. Each ensemble member is an independent diffused prediction, just initialized independently.
         # Latents of each such predictions across all input images and all ensemble members are represented in the
@@ -518,6 +543,20 @@ class OneStepPipeline(StableDiffusionControlNetPipeline):
             guess_mode=False,
             return_dict=False,
         )
+
+        if prior_tensor is not None and hf_mag is not None:
+            gated_down = []
+            for res in down_block_res_samples:
+                prior_res = F.interpolate(prior_tensor, size=res.shape[-2:], mode="area").clamp(0.0, 1.0)
+                hf_res = F.interpolate(hf_mag, size=res.shape[-2:], mode="area").clamp(0.0, 1.0)
+                gate = (1.0 + beta * prior_res * hf_res).clamp(1.0, 1.0 + beta)
+                gated_down.append(res * gate)
+            down_block_res_samples = gated_down
+
+            prior_mid = F.interpolate(prior_tensor, size=mid_block_res_sample.shape[-2:], mode="area").clamp(0.0, 1.0)
+            hf_mid = F.interpolate(hf_mag, size=mid_block_res_sample.shape[-2:], mode="area").clamp(0.0, 1.0)
+            gate_mid = (1.0 + beta * prior_mid * hf_mid).clamp(1.0, 1.0 + beta)
+            mid_block_res_sample = mid_block_res_sample * gate_mid
 
         # 7. Onestep sampling
         latent_x_t = self.unet(
@@ -555,6 +594,53 @@ class OneStepPipeline(StableDiffusionControlNetPipeline):
             latent=latent_x_t,
             gaus_noise=gaus_noise,
         )
+
+    def _prepare_prior_tensor(
+        self,
+        prior: Union[np.ndarray, torch.Tensor, Image.Image],
+        target_size: Tuple[int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+        batch_size: int,
+    ) -> torch.Tensor:
+        if isinstance(prior, Image.Image):
+            prior_tensor = torch.from_numpy(np.asarray(prior.convert("L"), dtype=np.float32))
+        elif isinstance(prior, np.ndarray):
+            prior_tensor = torch.from_numpy(np.nan_to_num(prior.astype(np.float32)))
+        elif torch.is_tensor(prior):
+            prior_tensor = prior.detach().float().cpu()
+        else:
+            raise TypeError(f"Unsupported prior type: {type(prior)!r}")
+
+        prior_tensor = prior_tensor.squeeze()
+        if prior_tensor.ndim == 2:
+            prior_tensor = prior_tensor.unsqueeze(0).unsqueeze(0)
+        elif prior_tensor.ndim == 3:
+            if prior_tensor.shape[0] in (1, 3):
+                prior_tensor = prior_tensor[:1].unsqueeze(0)
+            else:
+                prior_tensor = prior_tensor.unsqueeze(1)
+        elif prior_tensor.ndim == 4:
+            if prior_tensor.shape[1] != 1:
+                prior_tensor = prior_tensor[:, :1]
+        else:
+            raise ValueError(f"Unsupported prior shape: {tuple(prior_tensor.shape)}")
+
+        if prior_tensor.max() > 1.5:
+            prior_tensor = prior_tensor / 255.0
+        prior_tensor = prior_tensor.clamp(0.0, 1.0).to(device=device, dtype=dtype)
+        prior_tensor = F.interpolate(prior_tensor, size=target_size, mode="bilinear", align_corners=False)
+        if prior_tensor.shape[0] == 1 and batch_size > 1:
+            prior_tensor = prior_tensor.repeat(batch_size, 1, 1, 1)
+        if prior_tensor.shape[0] != batch_size:
+            raise ValueError(f"Prior batch size {prior_tensor.shape[0]} does not match image batch size {batch_size}.")
+        return prior_tensor
+
+    def _compute_hf_mag(self, image: torch.Tensor) -> torch.Tensor:
+        high_freq, _ = wavelet_decomposition(image)
+        hf_mag = high_freq.abs().mean(dim=1, keepdim=True)
+        mean = hf_mag.mean(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        return (hf_mag / mean).clamp(0.0, 1.0)
 
     # Copied from diffusers.pipelines.marigold.pipeline_marigold_depth.MarigoldDepthPipeline.prepare_latents
     def prepare_latents(
