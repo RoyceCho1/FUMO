@@ -1,5 +1,5 @@
 # batch_generate_heatmaps_from_dir.py
-# Process all images in a single folder and save .npy heatmaps to a sibling folder.
+# Process all images in a single folder and save .npy heatmaps to OUTPUT_DIR.
 
 import os
 import cv2
@@ -24,10 +24,22 @@ except ImportError:
 # =========================
 # Config (edit as needed)
 # =========================
-INPUT_DIR = "../../blended_images"
-OUTPUT_DIRNAME_SUFFIX = "prior"
+INPUT_DIR = "/home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/LQ_reflection_only"
+OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_reflection_only/P_int"
+GRAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_reflection_only/P_int_gray"
+HEATMAP_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_reflection_only/P_int_heatmap"
+OVERLAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_reflection_only/P_int_overlay"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 MODEL_PATH = "../Qwen2.5-VL-7B"
+
+# Save visualization PNGs for generated and existing npy priors.
+SAVE_GRAY_PNG = True
+SAVE_HEATMAP_PNG = True
+SAVE_OVERLAY_PNG = True
+VISUALIZE_EXISTING_NPY = True
+GENERATE_MISSING_NPY = True
+HEATMAP_COLORMAP = cv2.COLORMAP_TURBO
+OVERLAY_ALPHA = 0.35
 
 # --- heatmap params ---
 BOOST_FACTOR = 1.5
@@ -51,8 +63,8 @@ MAX_LONG_SIDE = 99999
 # =========================
 def build_output_path_in_sibling_dir(image_path, input_dir, output_dir, target_ext):
     """
-    Output to a sibling folder and keep the same filename with a new extension.
-    Example: /a/b/images/123.jpg -> /a/b/imagesprior/123.target_ext
+    Output to output_dir and keep the same filename with a new extension.
+    Example: /a/b/images/123.jpg -> output_dir/123.target_ext
     """
     if not image_path.startswith(os.path.abspath(input_dir)):
         return None
@@ -71,6 +83,63 @@ def list_images_in_dir(input_dir: str) -> List[str]:
         if ext in IMAGE_EXTS:
             files.append(path)
     return files
+
+
+def prior_to_uint8(prior: np.ndarray) -> np.ndarray:
+    if prior.ndim > 2:
+        prior = prior.squeeze()
+    prior = np.nan_to_num(prior, nan=0.0, posinf=1.0, neginf=0.0)
+    prior = np.clip(prior.astype(np.float32), 0.0, 1.0)
+    return (prior * 255.0 + 0.5).astype(np.uint8)
+
+
+def save_prior_visualizations(prior: np.ndarray, image_bgr: np.ndarray, prior_path: str) -> None:
+    if not (SAVE_GRAY_PNG or SAVE_HEATMAP_PNG or SAVE_OVERLAY_PNG):
+        return
+
+    stem = os.path.splitext(os.path.basename(prior_path))[0]
+    prior_u8 = prior_to_uint8(prior)
+    if image_bgr is not None and prior_u8.shape[:2] != image_bgr.shape[:2]:
+        prior_u8 = cv2.resize(prior_u8, (image_bgr.shape[1], image_bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+    if SAVE_GRAY_PNG:
+        os.makedirs(GRAY_OUTPUT_DIR, exist_ok=True)
+        cv2.imwrite(os.path.join(GRAY_OUTPUT_DIR, f"{stem}.png"), prior_u8)
+
+    color = None
+    if SAVE_HEATMAP_PNG or SAVE_OVERLAY_PNG:
+        color = cv2.applyColorMap(prior_u8, HEATMAP_COLORMAP)
+
+    if SAVE_HEATMAP_PNG:
+        os.makedirs(HEATMAP_OUTPUT_DIR, exist_ok=True)
+        cv2.imwrite(os.path.join(HEATMAP_OUTPUT_DIR, f"{stem}.png"), color)
+
+    if SAVE_OVERLAY_PNG and image_bgr is not None:
+        os.makedirs(OVERLAY_OUTPUT_DIR, exist_ok=True)
+        overlay = cv2.addWeighted(image_bgr, 1.0 - OVERLAY_ALPHA, color, OVERLAY_ALPHA, 0)
+        cv2.imwrite(os.path.join(OVERLAY_OUTPUT_DIR, f"{stem}.png"), overlay)
+
+
+def visualize_existing_priors(image_paths: List[str], input_dir: str, output_dir: str) -> int:
+    if not VISUALIZE_EXISTING_NPY:
+        return 0
+
+    count = 0
+    for img_path in tqdm(image_paths, desc="Visualizing existing P_int"):
+        prior_path = build_output_path_in_sibling_dir(img_path, input_dir, output_dir, ".npy")
+        if prior_path is None or not os.path.exists(prior_path):
+            continue
+        image_bgr = cv2.imread(img_path)
+        if image_bgr is None:
+            print(f"[Vis Skip] failed to read image: {img_path}")
+            continue
+        try:
+            prior = np.load(prior_path)
+            save_prior_visualizations(prior, image_bgr, prior_path)
+            count += 1
+        except Exception as e:
+            print(f"[Vis Skip] failed to visualize {prior_path}: {e}")
+    return count
 
 
 # =========================
@@ -223,6 +292,7 @@ def create_heatmap_for_image(blended_path, prior_path, model, processor, candida
     norm_resized = cv2.resize(norm, (final_w, final_h), interpolation=cv2.INTER_LINEAR)
     os.makedirs(os.path.dirname(prior_path), exist_ok=True)
     np.save(prior_path, norm_resized.astype(np.float32))
+    save_prior_visualizations(norm_resized, img_for_proc, prior_path)
 
     if "cuda" in str(device):
         torch.cuda.empty_cache()
@@ -262,13 +332,20 @@ def main():
         print(f"Error: input dir does not exist: {input_dir}")
         return
 
-    parent_dir = os.path.dirname(input_dir)
-    base_name = os.path.basename(input_dir.rstrip(os.sep))
-    output_dir = os.path.join(parent_dir, f"{base_name}{OUTPUT_DIRNAME_SUFFIX}")
+    output_dir = os.path.abspath(OUTPUT_DIR)
 
     image_paths = list_images_in_dir(input_dir)
     if not image_paths:
         print("Error: no images found in input dir.")
+        return
+
+    if SAVE_GRAY_PNG or SAVE_HEATMAP_PNG or SAVE_OVERLAY_PNG:
+        vis_count = visualize_existing_priors(image_paths, input_dir, output_dir)
+        if vis_count > 0:
+            print(f"Saved visualizations for {vis_count} existing P_int npy files.")
+
+    if not GENERATE_MISSING_NPY:
+        print("Generation disabled; existing visualization outputs updated only.")
         return
 
     print(f"Found {len(image_paths)} images. Building tasks...")
@@ -312,6 +389,8 @@ def main():
         p.join()
 
     print("\n--- All npy heatmaps generated ---")
+    if SAVE_GRAY_PNG or SAVE_HEATMAP_PNG or SAVE_OVERLAY_PNG:
+        print("--- Visualization outputs updated ---")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ Thumbs.db
 .vscode/
 
 # Training / inference artifacts
+results/
 outputs/
 output/
 logs/
@@ -52,3 +53,5 @@ checkpoint-*/
 HF_CACHE/
 .cache/
 
+Qwen2.5-VL/Qwen2.5-VL-7B/
+Qwen2.5-VL/Qwen2.5-VL-*-Instruct/
