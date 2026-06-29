@@ -1,12 +1,11 @@
 experiment:
-  name: baseline_sd21_qwen3
+  name: baseline_sd21base_qwen25_rrw_outdoor_50
   prompt: remove degradation
 
 paths:
-  lq_dir: /home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/LQ_RaindropRemoval_WeatherRemoval_iter45000
-  gt_dir: /home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/GT
-  prior_dir: /home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int
-  json_dir: /home/student_1/LoViF/FUMO/json/qwen3_vl_8b
+  json_dir: /home/student_1/LoViF/FUMO/json/lovif_qwen25_rrw_outdoor_50
+  train_jsonl: train.jsonl
+  validation_jsonl: /home/student_1/LoViF/FUMO/json/lovif_qwen25_rrw_outdoor_50/baseline_val.jsonl
   output_dir: /home/student_1/LoViF/FUMO/outputs
 
 split:
@@ -15,15 +14,15 @@ split:
   seed: 42
 
 sampling:
-  strategy: all_lq
+  strategy: merged_lovif_rrw_outdoor_50
 
 stage1:
-  pretrained_model_name_or_path: sd2-community/stable-diffusion-2-1
+  pretrained_model_name_or_path: Manojb/stable-diffusion-2-1-base
   resolution: 768
   train_batch_size: 1
   gradient_accumulation_steps: 2
   learning_rate: 2.0e-5
-  max_train_steps: 40000
+  max_train_steps: 50000
   checkpointing_steps: 2000
   log_interval: 100
   checkpoints_total_limit: 3

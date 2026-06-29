@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import random
+import shutil
 from pathlib import Path
 from typing import List, Tuple
 
@@ -31,7 +32,7 @@ import lpips
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import functional as TF
 from tqdm.auto import tqdm
@@ -48,7 +49,7 @@ from wavelet_color_fix import wavelet_decomposition
 logger = get_logger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(input_args=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train refinement network with frozen SD.")
     parser.add_argument("--train_data_dir", type=str, required=True, help="Directory containing jsonl files.")
     parser.add_argument(
@@ -80,9 +81,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"])
-    parser.add_argument("--report_to", type=str, default="tensorboard")
+    parser.add_argument("--report_to", type=str, default="none")
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--checkpointing_steps", type=int, default=1000)
+    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--validation_jsonl", type=str, default=None)
+    parser.add_argument("--validation_steps", type=int, default=1000)
+    parser.add_argument("--validation_batch_size", type=int, default=1)
+    parser.add_argument("--validation_num_workers", type=int, default=None)
+    parser.add_argument("--validation_example_index", type=int, default=0)
+    parser.add_argument("--validation_resolution_mode", type=str, default="square", choices=["square", "full"])
+    parser.add_argument("--validation_resize", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--validation_num_images", type=int, default=None)
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--l1_weight", type=float, default=0.5)
     parser.add_argument("--lpips_weight", type=float, default=0.25)
@@ -114,6 +124,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--unet_dir", type=str, required=True)
     parser.add_argument("--prompt", type=str, default="remove glass reflection")
     parser.add_argument("--beta", type=float, default=0.25)
+    if input_args is not None:
+        return parser.parse_args(input_args)
     return parser.parse_args()
 
 
@@ -157,6 +169,164 @@ def load_prior_tensor(prior_path: str) -> torch.Tensor:
     prior = np.clip(prior.astype(np.float32), 0.0, 1.0)
     prior_img = Image.fromarray((prior * 255.0).astype(np.uint8), mode="L")
     return TF.to_tensor(prior_img)  # [1,H,W]
+
+
+FINAL_SCORE_SSIM_WEIGHT = 10.0
+FINAL_SCORE_LPIPS_WEIGHT = 5.0
+
+
+def final_score(psnr_value: float, ssim_value: float, lpips_value: float) -> float:
+    return psnr_value + FINAL_SCORE_SSIM_WEIGHT * ssim_value - FINAL_SCORE_LPIPS_WEIGHT * lpips_value
+
+
+def rgb_to_y_tensor(image: torch.Tensor) -> torch.Tensor:
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+    if image.shape[1] == 1:
+        return image
+    if image.shape[1] != 3:
+        raise ValueError(f"Expected 1 or 3 channels, got {image.shape[1]}.")
+    r = image[:, 0:1]
+    g = image[:, 1:2]
+    b = image[:, 2:3]
+    return 0.256789 * r + 0.504129 * g + 0.097906 * b + 16.0 / 255.0
+
+
+def calculate_validation_metrics(pred: torch.Tensor, target: torch.Tensor, lpips_metric) -> dict:
+    pred = pred.clamp(0.0, 1.0)
+    target = target.to(device=pred.device, dtype=pred.dtype).clamp(0.0, 1.0)
+    pred_y = rgb_to_y_tensor(pred)
+    target_y = rgb_to_y_tensor(target)
+    mse = (pred_y - target_y).pow(2).flatten(1).mean(dim=1).clamp(min=1e-12)
+    psnr_value = (20.0 * torch.log10(1.0 / torch.sqrt(mse))).mean().item()
+
+    from utils.loss_utils import ssim
+
+    ssim_value = ssim(pred_y, target_y).item()
+    with torch.no_grad():
+        lpips_value = lpips_metric(pred * 2.0 - 1.0, target * 2.0 - 1.0).mean().item()
+
+    return {
+        "psnr": psnr_value,
+        "ssim": ssim_value,
+        "lpips": lpips_value,
+        "final_score": final_score(psnr_value, ssim_value, lpips_value),
+    }
+
+
+def tensor_to_pil(image: torch.Tensor) -> Image.Image:
+    image = image.detach().float().cpu().clamp(0.0, 1.0)
+    if image.ndim == 4:
+        image = image[0]
+    return TF.to_pil_image(image)
+
+
+def labeled_image_grid(images: List[Image.Image], labels: List[str]) -> Image.Image:
+    assert len(images) == len(labels)
+    w, h = images[0].size
+    label_height = max(36, h // 18)
+    grid = Image.new("RGB", size=(len(images) * w, h + label_height), color="white")
+    for idx, image in enumerate(images):
+        grid.paste(image.convert("RGB"), box=(idx * w, 0))
+
+    draw = ImageDraw.Draw(grid)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", size=max(18, w // 36))
+    except OSError:
+        font = ImageFont.load_default()
+
+    for idx, label in enumerate(labels):
+        bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        x = idx * w + (w - text_w) // 2
+        y = h + (label_height - text_h) // 2
+        draw.text((x, y), label, fill="black", font=font)
+    return grid
+
+
+def create_training_history() -> dict:
+    return {"train": [], "validation": []}
+
+
+def update_training_history(history: dict, split: str, step: int, values: dict) -> None:
+    payload = {"step": int(step)}
+    payload.update({key: float(value) for key, value in values.items() if value is not None})
+    history.setdefault(split, []).append(payload)
+
+
+def _plot_metric(axis, history: dict, metric: str) -> bool:
+    has_data = False
+    for split, entries in history.items():
+        xs = [entry["step"] for entry in entries if metric in entry]
+        ys = [entry[metric] for entry in entries if metric in entry]
+        if xs:
+            axis.plot(xs, ys, marker="o", linewidth=1.2, markersize=2.5, label=split)
+            has_data = True
+    return has_data
+
+
+def save_training_history(history: dict, output_dir: str) -> None:
+    log_dir = Path(output_dir) / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logger.warning("Skipping history plot because matplotlib is unavailable: %s", exc)
+        return
+
+    metrics = [
+        "loss/total",
+        "loss/l1",
+        "loss/lpips",
+        "loss/grad",
+        "lr",
+        "psnr",
+        "ssim",
+        "lpips",
+        "final_score",
+    ]
+    for metric in metrics:
+        fig, axis = plt.subplots(figsize=(8, 4.5))
+        has_data = _plot_metric(axis, history, metric)
+        axis.set_title(metric)
+        axis.set_xlabel("step")
+        axis.set_ylabel(metric)
+        axis.grid(True, alpha=0.3)
+        if has_data:
+            axis.legend(loc="best")
+        fig.tight_layout()
+        fig.savefig(log_dir / f"{metric.replace('/', '_')}.png", dpi=160)
+        plt.close(fig)
+
+
+def setup_rank0_file_logging(output_dir: str) -> None:
+    log_dir = Path(output_dir) / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "train.log"
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_path:
+            return
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
+    root_logger.addHandler(file_handler)
+    base_logger = getattr(logger, "logger", None)
+    if base_logger is not None:
+        base_logger.addHandler(file_handler)
+
+
+def save_refine_best_model(refine_net, refine_head, accelerator, output_dir: str, step: int, metrics: dict) -> None:
+    best_dir = Path(output_dir) / "best"
+    best_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(accelerator.unwrap_model(refine_net).state_dict(), best_dir / "nafnet_refine.pth")
+    torch.save(accelerator.unwrap_model(refine_head).state_dict(), best_dir / "nafnet_refine_head.pth")
+    payload = {"step": int(step), **{key: float(value) for key, value in metrics.items()}}
+    with open(best_dir / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
 
 
 class JsonlDataset(Dataset):
@@ -220,6 +390,51 @@ class JsonlDataset(Dataset):
                 f"Prior size {prior.shape[-2:]} does not match cond size {cond.shape[-2:]}."
             )
 
+        return {"cond": cond, "gt": gt, "prior": prior}
+
+
+class ValidationJsonlDataset(Dataset):
+    def __init__(
+        self,
+        entries: List[dict],
+        resolution: int,
+        resolution_mode: str = "square",
+        resize: Tuple[int, int] | None = None,
+        num_images: int | None = None,
+    ):
+        if num_images is not None:
+            entries = entries[: int(num_images)]
+        self.entries = entries
+        self.resolution = resolution
+        self.resolution_mode = resolution_mode
+        self.resize = tuple(resize) if resize is not None else None
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, idx: int) -> dict:
+        item = self.entries[idx]
+        cond = Image.open(item["conditioning_image"]).convert("RGB")
+        gt = Image.open(item["image"]).convert("RGB")
+        prior = TF.to_pil_image(load_prior_tensor(item["prior"]))
+
+        if self.resolution_mode == "square":
+            target_size = (self.resolution, self.resolution)
+        elif self.resize is not None:
+            target_size = self.resize
+        else:
+            target_size = cond.size
+
+        if cond.size != target_size:
+            cond = cond.resize(target_size, Image.Resampling.BILINEAR)
+        if gt.size != target_size:
+            gt = gt.resize(target_size, Image.Resampling.BILINEAR)
+        if prior.size != target_size:
+            prior = prior.resize(target_size, Image.Resampling.LANCZOS)
+
+        cond = TF.to_tensor(cond)
+        gt = TF.to_tensor(gt)
+        prior = TF.to_tensor(prior)
         return {"cond": cond, "gt": gt, "prior": prior}
 
 
@@ -402,12 +617,121 @@ def gradient_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(pred_dx, gt_dx) + F.l1_loss(pred_dy, gt_dy)
 
 
-def main() -> None:
-    args = parse_args()
+def build_refine_input(prelim: torch.Tensor, cond: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+    hf = compute_hf_image(cond)
+    return torch.cat([prelim, hf, prior, cond], dim=1)
+
+
+def apply_refine_residual(
+    refine_net,
+    refine_head,
+    prelim: torch.Tensor,
+    cond: torch.Tensor,
+    prior: torch.Tensor,
+    residual_scale: float = 0.1,
+) -> torch.Tensor:
+    feat = refine_net(build_refine_input(prelim, cond, prior))
+    residual = torch.tanh(refine_head(feat)) * residual_scale
+    return (prelim + residual).clamp(0.0, 1.0)
+
+
+def log_validation(
+    pipeline: OneStepPipeline,
+    refine_net,
+    refine_head,
+    val_dataloader: DataLoader,
+    args: argparse.Namespace,
+    accelerator: Accelerator,
+    lpips_metric,
+    step: int,
+) -> dict:
+    logger.info(
+        "Running refine validation... mode=%s resize=%s num_images=%s",
+        args.validation_resolution_mode,
+        args.validation_resize,
+        args.validation_num_images,
+    )
+    refine_net.eval()
+    refine_head.eval()
+
+    metric_sums = {"psnr": 0.0, "ssim": 0.0, "lpips": 0.0, "final_score": 0.0}
+    count = 0
+    image_log = None
+    save_idx = max(args.validation_example_index, 0)
+    seen = 0
+
+    val_iter = tqdm(
+        val_dataloader,
+        desc=f"Refine validation step {step}",
+        disable=not accelerator.is_main_process,
+        leave=True,
+    )
+
+    with torch.no_grad():
+        for batch in val_iter:
+            cond = batch["cond"].to(accelerator.device)
+            gt = batch["gt"].to(accelerator.device)
+            prior = batch["prior"].to(accelerator.device)
+
+            prelim_pred = infer_diff_prelim(pipeline, cond, prior, args.prompt, args.beta)
+            prelim = ((prelim_pred + 1.0) / 2.0).clamp(0.0, 1.0)
+            refined = apply_refine_residual(refine_net, refine_head, prelim, cond, prior)
+
+            metrics = calculate_validation_metrics(refined, gt, lpips_metric)
+            batch_size = cond.shape[0]
+            for key, value in metrics.items():
+                metric_sums[key] += value * batch_size
+            count += batch_size
+
+            if image_log is None and seen <= save_idx < seen + batch_size:
+                local_idx = save_idx - seen
+                image_log = {
+                    "cond": tensor_to_pil(cond[local_idx]),
+                    "prelim": tensor_to_pil(prelim[local_idx]),
+                    "refined": tensor_to_pil(refined[local_idx]),
+                    "gt": tensor_to_pil(gt[local_idx]),
+                }
+            seen += batch_size
+
+    if count == 0:
+        raise ValueError("Validation dataloader is empty.")
+
+    avg_metrics = {key: value / count for key, value in metric_sums.items()}
+    logger.info(
+        "Refine Validation Metrics [Avg] - PSNR: %.4f, SSIM: %.4f, LPIPS: %.4f, Final: %.4f",
+        avg_metrics["psnr"],
+        avg_metrics["ssim"],
+        avg_metrics["lpips"],
+        avg_metrics["final_score"],
+    )
+
+    refine_net.train()
+    refine_head.train()
+    return {"metrics": avg_metrics, "image_log": image_log}
+
+
+def save_validation_example(image_log: dict, output_dir: str, step: int) -> None:
+    if not image_log:
+        return
+    image_dir = Path(output_dir) / "validation_images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    grid = labeled_image_grid(
+        [image_log["cond"], image_log["prelim"], image_log["refined"], image_log["gt"]],
+        ["LQ", "prelim", "prediction", "GT"],
+    )
+    grid.save(image_dir / f"step_{int(step):06d}.png")
+
+
+def main(args: argparse.Namespace | None = None) -> None:
+    if args is None:
+        args = parse_args()
     if len(args.nafnet_enc_blk_nums) != len(args.nafnet_dec_blk_nums):
         raise ValueError("nafnet_enc_blk_nums and nafnet_dec_blk_nums must have the same length.")
     if args.nafnet_middle_blk_num < 0:
         raise ValueError("nafnet_middle_blk_num must be >= 0.")
+
+    if args.report_to is not None and args.report_to.lower() in {"none", "null", "false"}:
+        args.report_to = None
 
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -431,12 +755,14 @@ def main() -> None:
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
+        setup_rank0_file_logging(args.output_dir)
         tracker_config = dict(vars(args))
         tracker_config["nafnet_enc_blk_nums"] = ",".join(map(str, args.nafnet_enc_blk_nums))
         tracker_config["nafnet_dec_blk_nums"] = ",".join(map(str, args.nafnet_dec_blk_nums))
         tracker_config.pop("multiple_datasets", None)
         tracker_config.pop("multiple_datasets_probabilities", None)
-        accelerator.init_trackers("refine_diff", config=tracker_config)
+        if args.report_to is not None:
+            accelerator.init_trackers("refine_diff", config=tracker_config)
 
     if len(args.multiple_datasets) != len(args.multiple_datasets_probabilities):
         raise ValueError("multiple_datasets and multiple_datasets_probabilities must have same length.")
@@ -461,6 +787,24 @@ def main() -> None:
         pin_memory=True,
     )
 
+    val_dataloader = None
+    if args.validation_jsonl is not None:
+        val_entries = load_jsonl(args.validation_jsonl)
+        val_dataset = ValidationJsonlDataset(
+            val_entries,
+            resolution=args.resolution,
+            resolution_mode=args.validation_resolution_mode,
+            resize=args.validation_resize,
+            num_images=args.validation_num_images,
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            shuffle=False,
+            batch_size=args.validation_batch_size,
+            num_workers=args.validation_num_workers if args.validation_num_workers is not None else args.num_workers,
+            pin_memory=True,
+        )
+
     device = accelerator.device
     dtype = torch.float32
 
@@ -477,11 +821,18 @@ def main() -> None:
     refine_net.train()
 
     refine_head = torch.nn.Conv2d(in_ch, 3, kernel_size=1, bias=True).to(device)
+    torch.nn.init.zeros_(refine_head.weight)
+    torch.nn.init.zeros_(refine_head.bias)
     refine_head.train()
 
     lpips_model = lpips.LPIPS(net="alex").to(device)
     lpips_model.eval()
     for p in lpips_model.parameters():
+        p.requires_grad_(False)
+
+    validation_lpips_model = lpips.LPIPS(net="alex").to(device)
+    validation_lpips_model.eval()
+    for p in validation_lpips_model.parameters():
         p.requires_grad_(False)
 
     optimizer = torch.optim.AdamW(
@@ -532,6 +883,8 @@ def main() -> None:
     )
 
     global_step = 0
+    best_validation_score = float("-inf")
+    history = create_training_history()
     for epoch in range(args.epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(refine_net):
@@ -548,11 +901,8 @@ def main() -> None:
                         args.beta,
                     )
                     prelim = ((prelim_pred + 1.0) / 2.0).clamp(0.0, 1.0)
-                    hf = compute_hf_image(cond)
 
-                x = torch.cat([prelim, hf, prior, cond], dim=1)
-                feat = refine_net(x)
-                refined = refine_head(feat).clamp(0.0, 1.0)
+                refined = apply_refine_residual(refine_net, refine_head, prelim, cond, prior)
 
                 l1_val = l1_loss(refined, gt)
                 lpips_val = lpips_model(
@@ -589,10 +939,39 @@ def main() -> None:
                             for removing in checkpoints[:num_to_remove]:
                                 removing_path = os.path.join(args.output_dir, removing)
                                 try:
-                                    import shutil
                                     shutil.rmtree(removing_path)
                                 except OSError:
                                     pass
+
+                if (
+                    accelerator.is_main_process
+                    and val_dataloader is not None
+                    and global_step % args.validation_steps == 0
+                ):
+                    validation_output = log_validation(
+                        pipeline,
+                        accelerator.unwrap_model(refine_net),
+                        accelerator.unwrap_model(refine_head),
+                        val_dataloader,
+                        args,
+                        accelerator,
+                        validation_lpips_model,
+                        global_step,
+                    )
+                    metrics = validation_output["metrics"]
+                    save_validation_example(validation_output["image_log"], args.output_dir, global_step)
+                    update_training_history(history, "validation", global_step, metrics)
+                    save_training_history(history, args.output_dir)
+                    if metrics["final_score"] > best_validation_score:
+                        best_validation_score = metrics["final_score"]
+                        logger.info(
+                            "New best refine final_score: %.4f. Saving best refine modules...",
+                            best_validation_score,
+                        )
+                        save_refine_best_model(refine_net, refine_head, accelerator, args.output_dir, global_step, metrics)
+
+                if val_dataloader is not None and global_step % args.validation_steps == 0:
+                    accelerator.wait_for_everyone()
 
             logs = {
                 "loss/total": loss.detach().item(),
@@ -602,6 +981,19 @@ def main() -> None:
                 "lr": lr_scheduler.get_last_lr()[0],
             }
             progress_bar.set_postfix(loss=logs["loss/total"])
+            if accelerator.is_main_process and global_step % args.log_interval == 0:
+                update_training_history(history, "train", global_step, logs)
+                save_training_history(history, args.output_dir)
+                logger.info(
+                    "Iteration [%d/%d] Loss: %.6f L1: %.6f LPIPS: %.6f Grad: %.6f LR: %.8f",
+                    global_step,
+                    max_train_steps,
+                    logs["loss/total"],
+                    logs["loss/l1"],
+                    logs["loss/lpips"],
+                    logs["loss/grad"],
+                    logs["lr"],
+                )
             accelerator.log(
                 {
                     "loss/total": logs["loss/total"],
@@ -626,6 +1018,24 @@ def main() -> None:
         final_head_path = os.path.join(args.output_dir, "nafnet_refine_head_final.pth")
         torch.save(accelerator.unwrap_model(refine_net).state_dict(), final_net_path)
         torch.save(accelerator.unwrap_model(refine_head).state_dict(), final_head_path)
+
+        if val_dataloader is not None:
+            validation_output = log_validation(
+                pipeline,
+                accelerator.unwrap_model(refine_net),
+                accelerator.unwrap_model(refine_head),
+                val_dataloader,
+                args,
+                accelerator,
+                validation_lpips_model,
+                global_step,
+            )
+            metrics = validation_output["metrics"]
+            save_validation_example(validation_output["image_log"], args.output_dir, global_step)
+            update_training_history(history, "validation", global_step, metrics)
+            save_training_history(history, args.output_dir)
+            if metrics["final_score"] > best_validation_score:
+                save_refine_best_model(refine_net, refine_head, accelerator, args.output_dir, global_step, metrics)
 
 
 if __name__ == "__main__":

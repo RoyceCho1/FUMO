@@ -1,0 +1,52 @@
+experiment:
+  name: refine_sd21_qwen3
+  prompt: remove degradation
+
+paths:
+  json_dir: /home/student_1/LoViF/FUMO/json/qwen3_vl_8b
+  train_jsonl: baseline_train.jsonl
+  validation_jsonl: /home/student_1/LoViF/FUMO/json/qwen3_vl_8b/baseline_val.jsonl
+  output_dir: /home/student_1/LoViF/FUMO/outputs
+  pretrained_model_name_or_path: sd2-community/stable-diffusion-2-1
+  controlnet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_sd21_qwen3_20260627_181616/best/controlnet
+  unet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_sd21_qwen3_20260627_181616/best/unet
+
+stage2:
+  multiple_datasets_probabilities: [1.0]
+  resolution: 768
+  resize_scale: 1.1
+  disable_augment: false
+  batch_size: 1
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-5
+  lr_warmup_steps: 500
+  weight_decay: 1.0e-4
+  max_train_steps: 20000
+  checkpointing_steps: 2000
+  checkpoints_total_limit: 2
+  log_interval: 100
+  validation_steps: 1000
+  validation_batch_size: 1
+  validation_example_index: 0
+  num_workers: 4
+  mixed_precision: bf16
+  report_to: none
+  l1_weight: 0.5
+  lpips_weight: 0.25
+  grad_weight: 0.25
+  nafnet_width: 64
+  nafnet_middle_blk_num: 1
+  nafnet_enc_blk_nums: [1, 1, 1, 28]
+  nafnet_dec_blk_nums: [1, 1, 1, 1]
+  beta: 0.25
+  seed: 42
+
+validation:
+  enabled: true
+  # DiffUR3-style sampling validation: run full-image inference, then score against GT at the same size.
+  resolution_mode: full
+  resize: [1080, 720]
+  num_images: null
+  batch_size: 1
+  num_workers: 4

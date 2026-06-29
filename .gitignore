@@ -39,6 +39,7 @@ events.out.tfevents.*
 *.onnx
 
 # Data / generated files
+json/
 json/*.json
 json/*.jsonl
 *.npy

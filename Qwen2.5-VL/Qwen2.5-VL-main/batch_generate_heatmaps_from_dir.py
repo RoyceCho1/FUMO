@@ -8,7 +8,15 @@ from PIL import Image
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+except ImportError:
+    Qwen3VLForConditionalGeneration = None
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration
+except ImportError:
+    Qwen2_5_VLForConditionalGeneration = None
 import re
 import multiprocessing
 from typing import List
@@ -24,13 +32,14 @@ except ImportError:
 # =========================
 # Config (edit as needed)
 # =========================
-INPUT_DIR = "/home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/LQ_RaindropRemoval_WeatherRemoval_iter45000"
-OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int"
-GRAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int_gray"
-HEATMAP_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int_heatmap"
-OVERLAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int_overlay"
+INPUT_DIR = "/home/student_1/LoViF/FUMO/data/RRW_outdoor_50/LQ"
+OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/RRW_outdoor_50/Qwen2.5-VL-7B/P_int"
+GRAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/RRW_outdoor_50/Qwen2.5-VL-7B/P_int_gray"
+HEATMAP_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/RRW_outdoor_50/Qwen2.5-VL-7B/P_int_heatmap"
+OVERLAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/RRW_outdoor_50/Qwen2.5-VL-7B/P_int_overlay"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-MODEL_PATH = "../Qwen3-VL-8B-Instruct"
+MODEL_PATH = "/home/student_1/LoViF/FUMO/Qwen2.5-VL/Qwen2.5-VL-7B"
+MODEL_FAMILY = "qwen2.5"
 
 # Save visualization PNGs for generated and existing npy priors.
 SAVE_GRAY_PNG = True
@@ -58,6 +67,20 @@ EPS = 1e-6
 
 # resize if long side exceeds this value
 MAX_LONG_SIDE = 99999
+
+
+def get_model_class():
+    family = str(MODEL_FAMILY).lower().replace("_", "-")
+    if family in {"qwen2.5", "qwen2-5", "qwen25", "qwen2.5-vl"}:
+        if Qwen2_5_VLForConditionalGeneration is None:
+            raise ImportError("Qwen2_5_VLForConditionalGeneration is not available in this transformers install.")
+        return Qwen2_5_VLForConditionalGeneration
+    if family in {"qwen3", "qwen3-vl"}:
+        if Qwen3VLForConditionalGeneration is None:
+            raise ImportError("Qwen3VLForConditionalGeneration is not available in this transformers install.")
+        return Qwen3VLForConditionalGeneration
+    raise ValueError(f"Unsupported MODEL_FAMILY: {MODEL_FAMILY}")
+
 
 # =========================
 # Path utilities
@@ -304,7 +327,8 @@ def worker(tasks, device_id, tokenizer):
     print(f"Worker started on device {device}")
 
     try:
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_cls = get_model_class()
+        model = model_cls.from_pretrained(
             MODEL_PATH,
             dtype="auto",
             device_map={"": device},
@@ -324,6 +348,10 @@ def worker(tasks, device_id, tokenizer):
 
 
 def main():
+    print(f"Input: {INPUT_DIR}")
+    print(f"Output: {OUTPUT_DIR}")
+    print(f"Model: {MODEL_PATH} ({MODEL_FAMILY})")
+
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
         print("Error: no CUDA devices found.")

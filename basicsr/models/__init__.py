@@ -17,11 +17,15 @@ model_filenames = [
     osp.splitext(osp.basename(v))[0] for v in scandir(model_folder)
     if v.endswith('_model.py')
 ]
-# import all the model modules
-_model_modules = [
-    importlib.import_module(f'basicsr.models.{file_name}')
-    for file_name in model_filenames
-]
+# import all the model modules. Some FUMO workflows only use arch modules
+# and ship without the full BasicSR metric registry, so optional model imports
+# should not block direct architecture imports such as NAFNet.
+_model_modules = []
+for file_name in model_filenames:
+    try:
+        _model_modules.append(importlib.import_module(f'basicsr.models.{file_name}'))
+    except ModuleNotFoundError:
+        continue
 
 
 def create_model(opt):
