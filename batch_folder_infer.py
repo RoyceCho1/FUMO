@@ -22,6 +22,7 @@ from tqdm import tqdm
 from basicsr.models.archs.NAFNet_arch import NAFNet
 from diffusion.controlnetvae import ControlNetVAEModel
 from diffusion.pipeline_onestep import OneStepPipeline
+from fumo_mlocal import load_map_tensor, resolve_m_local_path
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from transformers import CLIPTextModel, AutoTokenizer
 
@@ -85,6 +86,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", type=str, default="remove glass reflection")
     parser.add_argument("--beta", type=float, default=0.25)
+    parser.add_argument("--use_m_local_diffusion", action="store_true", help="Use M_local in the diffusion gate.")
+    parser.add_argument("--use_m_local_refine", action="store_true", help="Concatenate M_local into the refine input.")
+    parser.add_argument("--m_local_dirs", type=str, nargs="*", default=None, help="Directories searched by conditioning image stem for M_local npy files.")
+    parser.add_argument("--m_local_column", type=str, default="m_local")
+    parser.add_argument("--m_local_lambda", type=float, default=0.5)
+    parser.add_argument("--m_local_missing_policy", type=str, default="error", choices=["error", "zero"])
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--num_gpus",
@@ -127,8 +134,8 @@ def load_jsonl_entries(path: str) -> List[dict]:
     return entries
 
 
-def build_tasks_from_jsonl(jsonl_dir: str, jsonl_files: List[str]) -> List[Tuple[str, str]]:
-    tasks: List[Tuple[str, str]] = []
+def build_tasks_from_jsonl(jsonl_dir: str, jsonl_files: List[str]) -> List[Tuple[str, str, dict]]:
+    tasks: List[Tuple[str, str, dict]] = []
     for jsonl_name in jsonl_files:
         jsonl_path = jsonl_name if os.path.isabs(jsonl_name) else os.path.join(jsonl_dir, jsonl_name)
         for item in load_jsonl_entries(jsonl_path):
@@ -136,16 +143,16 @@ def build_tasks_from_jsonl(jsonl_dir: str, jsonl_files: List[str]) -> List[Tuple
             prior_path = item.get("prior")
             if img_path is None or prior_path is None:
                 raise ValueError(f"Missing conditioning_image/prior in {jsonl_path}")
-            tasks.append((img_path, prior_path))
+            tasks.append((img_path, prior_path, item))
     return tasks
 
 
-def build_tasks_from_dirs(blended_dir: str, prior_dir: str) -> List[Tuple[str, str]]:
-    tasks: List[Tuple[str, str]] = []
+def build_tasks_from_dirs(blended_dir: str, prior_dir: str) -> List[Tuple[str, str, dict]]:
+    tasks: List[Tuple[str, str, dict]] = []
     for img_path in list_images(blended_dir):
         base = os.path.splitext(os.path.basename(img_path))[0]
         prior_path = os.path.join(prior_dir, f"{base}.npy")
-        tasks.append((img_path, prior_path))
+        tasks.append((img_path, prior_path, {}))
     return tasks
 
 
@@ -167,17 +174,17 @@ def get_output_paths(args: argparse.Namespace, img_path: str) -> Tuple[str, str]
 
 def filter_pending_tasks(
     args: argparse.Namespace,
-    tasks: List[Tuple[str, str]],
+    tasks: List[Tuple[str, str, dict]],
     noimg: bool,
-) -> List[Tuple[str, str]]:
+) -> List[Tuple[str, str, dict]]:
     if noimg:
         return tasks
     pending = []
-    for img_path, prior_path in tasks:
+    for img_path, prior_path, item in tasks:
         diff_path, refine_path = get_output_paths(args, img_path)
         if os.path.exists(diff_path) and os.path.exists(refine_path):
             continue
-        pending.append((img_path, prior_path))
+        pending.append((img_path, prior_path, item))
     return pending
 
 
@@ -233,7 +240,7 @@ def load_pipeline(args: argparse.Namespace, device: torch.device, dtype: torch.d
 
 
 def load_refine_models(args: argparse.Namespace, device: torch.device) -> tuple[NAFNet, torch.nn.Module]:
-    in_ch = 10
+    in_ch = 10 + int(args.use_m_local_refine)
     refine_net = NAFNet(
         img_channel=in_ch,
         width=args.nafnet_width,
@@ -243,8 +250,14 @@ def load_refine_models(args: argparse.Namespace, device: torch.device) -> tuple[
     ).to(device)
     refine_head = torch.nn.Conv2d(in_ch, 3, kernel_size=1, bias=True).to(device)
 
-    refine_net.load_state_dict(torch.load(args.refine_net_path, map_location="cpu"))
-    refine_head.load_state_dict(torch.load(args.refine_head_path, map_location="cpu"))
+    try:
+        refine_net.load_state_dict(torch.load(args.refine_net_path, map_location="cpu"))
+        refine_head.load_state_dict(torch.load(args.refine_head_path, map_location="cpu"))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load refine checkpoint with in_ch={in_ch}. "
+            "Check that --use_m_local_refine matches the checkpoint (10ch off, 11ch on)."
+        ) from exc
     refine_net.eval()
     refine_head.eval()
     return refine_net, refine_head
@@ -290,6 +303,8 @@ def infer_with_diff(
     prompt: str,
     prior_tensor: torch.Tensor,
     beta: float,
+    m_local_tensor: torch.Tensor | None = None,
+    m_local_lambda: float = 0.5,
 ) -> np.ndarray:
     device = pipeline._execution_device
     dtype = pipeline.dtype
@@ -331,6 +346,10 @@ def infer_with_diff(
 
     prior = prior_tensor.to(device=device, dtype=dtype)
     prior = F.interpolate(prior, size=image.shape[-2:], mode="bilinear", align_corners=False)
+    if m_local_tensor is not None:
+        m_local = m_local_tensor.to(device=device, dtype=dtype)
+        m_local = F.interpolate(m_local, size=image.shape[-2:], mode="bilinear", align_corners=False)
+        prior = (prior + m_local_lambda * m_local).clamp(0.0, 1.0)
     hf_mag = compute_hf_mag(image)
 
     down_block_res_samples, mid_block_res_sample = pipeline.controlnet(
@@ -384,9 +403,14 @@ def refine_image(
     cond_tensor: torch.Tensor,
     prelim_tensor: torch.Tensor,
     prior_tensor: torch.Tensor,
+    m_local_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor:
     hf = compute_hf_image(cond_tensor)
-    x = torch.cat([prelim_tensor, hf, prior_tensor, cond_tensor], dim=1)
+    parts = [prelim_tensor, hf, prior_tensor]
+    if m_local_tensor is not None:
+        parts.append(m_local_tensor)
+    parts.append(cond_tensor)
+    x = torch.cat(parts, dim=1)
     feat = refine_net(x)
     refined = refine_head(feat).clamp(0.0, 1.0)
     return refined
@@ -404,9 +428,9 @@ def process_single_task(
     refine_head: torch.nn.Module,
     args: argparse.Namespace,
     device: torch.device,
-    task: Tuple[str, str],
+    task: Tuple[str, str, dict],
 ) -> bool:
-    img_path, prior_path = task
+    img_path, prior_path, item = task
     if not os.path.exists(prior_path):
         print(f"[Skip] missing prior: {prior_path}")
         return False
@@ -417,6 +441,21 @@ def process_single_task(
 
     w, h = blended.size
     prior_tensor = load_prior_tensor(prior_path, (w, h)).to(device)
+    m_local_tensor = None
+    if args.use_m_local_diffusion or args.use_m_local_refine:
+        resolved_m_local_path = resolve_m_local_path(
+            item,
+            img_path,
+            args.m_local_dirs,
+            args.m_local_column,
+            args.m_local_missing_policy,
+        )
+        if resolved_m_local_path is None:
+            m_local_tensor = torch.zeros_like(prior_tensor)
+        else:
+            m_local_tensor = load_map_tensor(resolved_m_local_path).unsqueeze(0)
+            m_local_tensor = F.interpolate(m_local_tensor, size=prior_tensor.shape[-2:], mode="bilinear", align_corners=False)
+            m_local_tensor = m_local_tensor.to(device)
 
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -427,6 +466,8 @@ def process_single_task(
             args.prompt,
             prior_tensor,
             args.beta,
+            m_local_tensor=m_local_tensor if args.use_m_local_diffusion else None,
+            m_local_lambda=args.m_local_lambda,
         )
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -443,6 +484,7 @@ def process_single_task(
             blended_tensor,
             pred_tensor,
             prior_tensor,
+            m_local_tensor=m_local_tensor if args.use_m_local_refine else None,
         )
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -496,7 +538,7 @@ def run_worker(args: argparse.Namespace, tasks: List[Tuple[str, str]], device_st
         )
 
 
-def split_tasks_round_robin(tasks: List[Tuple[str, str]], num_parts: int) -> List[List[Tuple[str, str]]]:
+def split_tasks_round_robin(tasks: List[Tuple[str, str, dict]], num_parts: int) -> List[List[Tuple[str, str, dict]]]:
     chunks: List[List[Tuple[str, str]]] = [[] for _ in range(num_parts)]
     for idx, task in enumerate(tasks):
         chunks[idx % num_parts].append(task)

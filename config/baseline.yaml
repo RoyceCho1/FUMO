@@ -1,12 +1,11 @@
 experiment:
-  name: baseline_sd21_qwen3
+  name: baseline_lovif_constant_ema
   prompt: remove degradation
 
 paths:
-  lq_dir: /home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/LQ_RaindropRemoval_WeatherRemoval_iter45000
-  gt_dir: /home/student_1/LoViF/LOVIF_repo/data/RDRF_dataset/train/GT
-  prior_dir: /home/student_1/LoViF/FUMO/results/LQ_RaindropRemoval_WeatherRemoval_iter45000/Qwen3-VL-8B/P_int
-  json_dir: /home/student_1/LoViF/FUMO/json/qwen3_vl_8b
+  json_dir: /home/student_1/LoViF/FUMO/json
+  train_jsonl: baseline_train.jsonl
+  validation_jsonl: /home/student_1/LoViF/FUMO/json/baseline_val.jsonl
   output_dir: /home/student_1/LoViF/FUMO/outputs
 
 split:
@@ -15,15 +14,15 @@ split:
   seed: 42
 
 sampling:
-  strategy: all_lq
+  strategy: lovif_only_all_lq
 
 stage1:
-  pretrained_model_name_or_path: sd2-community/stable-diffusion-2-1
+  pretrained_model_name_or_path: Manojb/stable-diffusion-2-1-base
   resolution: 768
   train_batch_size: 1
   gradient_accumulation_steps: 2
   learning_rate: 2.0e-5
-  max_train_steps: 40000
+  max_train_steps: 100000
   checkpointing_steps: 2000
   log_interval: 100
   checkpoints_total_limit: 3
@@ -34,11 +33,17 @@ stage1:
   mixed_precision: bf16
   report_to: none
   tracker_project_name: fumo_baseline
-  lr_scheduler: cosine
-  lr_warmup_steps: 1000
+  lr_scheduler: constant
+  lr_warmup_steps: 0
   beta_max: 0.25
   beta_warmup_ratio: 0.1
   shrink_prob: 0.1
+  use_controlnet_ema: true
+  use_unet_ema: true
+  ema_decay: 0.999
+  use_m_local_diffusion: false
+  m_local_lambda: 0.5
+  m_local_missing_policy: error
   seed: 42
   enable_xformers_memory_efficient_attention: false
   gradient_checkpointing: true

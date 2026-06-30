@@ -87,7 +87,7 @@ def add_arg(args: list, name: str, value):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Launch FUMO refine training from a YAML config.")
-    parser.add_argument("--config", default="config/refine_baseline.yaml")
+    parser.add_argument("--config", default="config/refine.yaml")
     parser.add_argument("--dry_run", action="store_true", help="Print resolved train_refine args without running.")
     parsed = parser.parse_args()
 
@@ -120,6 +120,7 @@ def main() -> None:
     add_arg(train_args, "controlnet_dir", paths["controlnet_dir"])
     add_arg(train_args, "unet_dir", paths["unet_dir"])
     add_arg(train_args, "prompt", config.get("experiment", {}).get("prompt", "remove degradation"))
+    add_arg(train_args, "m_local_dirs", paths.get("m_local_dirs"))
 
     for key in (
         "seed",
@@ -139,6 +140,9 @@ def main() -> None:
         "report_to",
         "logging_dir",
         "checkpointing_steps",
+        "resume_from_checkpoint",
+        "use_ema",
+        "ema_decay",
         "log_interval",
         "validation_steps",
         "validation_example_index",
@@ -151,6 +155,11 @@ def main() -> None:
         "nafnet_enc_blk_nums",
         "nafnet_dec_blk_nums",
         "beta",
+        "use_m_local_diffusion",
+        "use_m_local_refine",
+        "m_local_column",
+        "m_local_lambda",
+        "m_local_missing_policy",
     ):
         add_arg(train_args, key, stage2.get(key))
 

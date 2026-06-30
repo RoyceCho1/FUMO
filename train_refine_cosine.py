@@ -16,6 +16,7 @@ Pipeline:
 """
 
 import argparse
+import copy
 import json
 import logging
 import math
@@ -43,6 +44,7 @@ from transformers import CLIPTextModel, AutoTokenizer
 
 from diffusion.controlnetvae import ControlNetVAEModel
 from diffusion.pipeline_onestep import OneStepPipeline
+from fumo_mlocal import load_map_pil, resolve_m_local_path
 from wavelet_color_fix import wavelet_decomposition
 
 
@@ -84,6 +86,9 @@ def parse_args(input_args=None) -> argparse.Namespace:
     parser.add_argument("--report_to", type=str, default="none")
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--checkpointing_steps", type=int, default=1000)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--use_ema", action="store_true")
+    parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--validation_jsonl", type=str, default=None)
     parser.add_argument("--validation_steps", type=int, default=1000)
@@ -124,6 +129,12 @@ def parse_args(input_args=None) -> argparse.Namespace:
     parser.add_argument("--unet_dir", type=str, required=True)
     parser.add_argument("--prompt", type=str, default="remove glass reflection")
     parser.add_argument("--beta", type=float, default=0.25)
+    parser.add_argument("--use_m_local_diffusion", action="store_true", help="Use M_local in the diffusion prelim gate.")
+    parser.add_argument("--use_m_local_refine", action="store_true", help="Concatenate M_local into the refine network input.")
+    parser.add_argument("--m_local_dirs", type=str, nargs="*", default=None, help="Directories searched by conditioning image stem for M_local npy files.")
+    parser.add_argument("--m_local_column", type=str, default="m_local", help="Jsonl column containing an optional M_local npy path.")
+    parser.add_argument("--m_local_lambda", type=float, default=0.5, help="Weight applied to M_local in the diffusion gate prior.")
+    parser.add_argument("--m_local_missing_policy", type=str, default="error", choices=["error", "zero"], help="How to handle missing M_local maps when M_local is enabled.")
     if input_args is not None:
         return parser.parse_args(input_args)
     return parser.parse_args()
@@ -319,22 +330,99 @@ def setup_rank0_file_logging(output_dir: str) -> None:
         base_logger.addHandler(file_handler)
 
 
+def unwrap_for_state_dict(module, accelerator: Accelerator | None = None):
+    return accelerator.unwrap_model(module) if accelerator is not None else module
+
+
+def save_refine_modules(
+    refine_net,
+    refine_head,
+    output_dir: str | Path,
+    net_name: str = "nafnet_refine.pth",
+    head_name: str = "nafnet_refine_head.pth",
+    accelerator: Accelerator | None = None,
+) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(unwrap_for_state_dict(refine_net, accelerator).state_dict(), output_dir / net_name)
+    torch.save(unwrap_for_state_dict(refine_head, accelerator).state_dict(), output_dir / head_name)
+
+
 def save_refine_best_model(refine_net, refine_head, accelerator, output_dir: str, step: int, metrics: dict) -> None:
     best_dir = Path(output_dir) / "best"
-    best_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(accelerator.unwrap_model(refine_net).state_dict(), best_dir / "nafnet_refine.pth")
-    torch.save(accelerator.unwrap_model(refine_head).state_dict(), best_dir / "nafnet_refine_head.pth")
+    save_refine_modules(refine_net, refine_head, best_dir, accelerator=accelerator)
     payload = {"step": int(step), **{key: float(value) for key, value in metrics.items()}}
     with open(best_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
 
 
+def clone_ema_module(module):
+    ema_module = copy.deepcopy(module)
+    ema_module.eval()
+    for parameter in ema_module.parameters():
+        parameter.requires_grad_(False)
+    return ema_module
+
+
+@torch.no_grad()
+def copy_module_state(target, source) -> None:
+    target.load_state_dict(source.state_dict())
+
+
+@torch.no_grad()
+def update_ema_module(ema_module, source_module, decay: float) -> None:
+    ema_state = ema_module.state_dict()
+    source_state = source_module.state_dict()
+    for key, ema_value in ema_state.items():
+        source_value = source_state[key].detach()
+        if torch.is_floating_point(ema_value):
+            ema_value.mul_(decay).add_(source_value.to(device=ema_value.device, dtype=ema_value.dtype), alpha=1.0 - decay)
+        else:
+            ema_value.copy_(source_value.to(device=ema_value.device))
+
+
+def save_ema_checkpoint(ema_refine_net, ema_refine_head, checkpoint_dir: str | Path) -> None:
+    save_refine_modules(
+        ema_refine_net,
+        ema_refine_head,
+        checkpoint_dir,
+        net_name="ema_nafnet_refine.pth",
+        head_name="ema_nafnet_refine_head.pth",
+        accelerator=None,
+    )
+
+
+def load_ema_checkpoint(ema_refine_net, ema_refine_head, checkpoint_dir: str | Path, device: torch.device) -> bool:
+    checkpoint_dir = Path(checkpoint_dir)
+    net_path = checkpoint_dir / "ema_nafnet_refine.pth"
+    head_path = checkpoint_dir / "ema_nafnet_refine_head.pth"
+    if not net_path.exists() or not head_path.exists():
+        return False
+    ema_refine_net.load_state_dict(torch.load(net_path, map_location=device))
+    ema_refine_head.load_state_dict(torch.load(head_path, map_location=device))
+    return True
+
+
 class JsonlDataset(Dataset):
-    def __init__(self, entries: List[dict], resolution: int, resize_scale: float, disable_augment: bool):
+    def __init__(
+        self,
+        entries: List[dict],
+        resolution: int,
+        resize_scale: float,
+        disable_augment: bool,
+        load_m_local: bool = False,
+        m_local_dirs: List[str] | None = None,
+        m_local_column: str = "m_local",
+        m_local_missing_policy: str = "error",
+    ):
         self.entries = entries
         self.resolution = resolution
         self.resize_scale = resize_scale
         self.disable_augment = disable_augment
+        self.load_m_local = load_m_local
+        self.m_local_dirs = m_local_dirs
+        self.m_local_column = m_local_column
+        self.m_local_missing_policy = m_local_missing_policy
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -352,45 +440,77 @@ class JsonlDataset(Dataset):
         gt = Image.open(gt_path).convert("RGB")
         prior = load_prior_tensor(prior_path)
         prior = TF.to_pil_image(prior)
+        if self.load_m_local:
+            resolved_m_local_path = resolve_m_local_path(
+                item,
+                cond_path,
+                self.m_local_dirs,
+                self.m_local_column,
+                self.m_local_missing_policy,
+            )
+            m_local = Image.new("L", cond.size, color=0) if resolved_m_local_path is None else load_map_pil(resolved_m_local_path)
+        else:
+            m_local = None
 
         if self.disable_augment:
             cond = self._resize(cond, self.resolution)
             gt = self._resize(gt, self.resolution)
             prior = self._resize(prior, self.resolution)
+            if m_local is not None:
+                m_local = self._resize(m_local, self.resolution)
             if prior.size != cond.size:
                 prior = prior.resize(cond.size, Image.Resampling.LANCZOS)
+            if m_local is not None and m_local.size != cond.size:
+                m_local = m_local.resize(cond.size, Image.Resampling.LANCZOS)
         else:
             resize_size = int(self.resolution * self.resize_scale)
             cond = self._resize(cond, resize_size)
             gt = self._resize(gt, resize_size)
             prior = self._resize(prior, self.resolution)
+            if m_local is not None:
+                m_local = self._resize(m_local, self.resolution)
             if prior.size != cond.size:
                 prior = prior.resize(cond.size, Image.Resampling.LANCZOS)
+            if m_local is not None and m_local.size != cond.size:
+                m_local = m_local.resize(cond.size, Image.Resampling.LANCZOS)
 
             i, j = torch.randint(0, resize_size - self.resolution + 1, (2,)).tolist()
             cond = TF.crop(cond, i, j, self.resolution, self.resolution)
             gt = TF.crop(gt, i, j, self.resolution, self.resolution)
             prior = TF.crop(prior, i, j, self.resolution, self.resolution)
+            if m_local is not None:
+                m_local = TF.crop(m_local, i, j, self.resolution, self.resolution)
 
             if random.random() < 0.5:
                 cond = TF.hflip(cond)
                 gt = TF.hflip(gt)
                 prior = TF.hflip(prior)
+                if m_local is not None:
+                    m_local = TF.hflip(m_local)
             if random.random() < 0.5:
                 cond = TF.vflip(cond)
                 gt = TF.vflip(gt)
                 prior = TF.vflip(prior)
+                if m_local is not None:
+                    m_local = TF.vflip(m_local)
 
         cond = TF.to_tensor(cond)  # [0,1]
         gt = TF.to_tensor(gt)      # [0,1]
         prior = TF.to_tensor(prior)  # [1,H,W]
+        result = {"cond": cond, "gt": gt, "prior": prior}
+        if m_local is not None:
+            result["m_local"] = TF.to_tensor(m_local)
 
         if prior.shape[-2:] != cond.shape[-2:]:
             raise ValueError(
                 f"Prior size {prior.shape[-2:]} does not match cond size {cond.shape[-2:]}."
             )
+        if "m_local" in result and result["m_local"].shape[-2:] != cond.shape[-2:]:
+            raise ValueError(
+                f"M_local size {result['m_local'].shape[-2:]} does not match cond size {cond.shape[-2:]}."
+            )
 
-        return {"cond": cond, "gt": gt, "prior": prior}
+        return result
 
 
 class ValidationJsonlDataset(Dataset):
@@ -401,6 +521,10 @@ class ValidationJsonlDataset(Dataset):
         resolution_mode: str = "square",
         resize: Tuple[int, int] | None = None,
         num_images: int | None = None,
+        load_m_local: bool = False,
+        m_local_dirs: List[str] | None = None,
+        m_local_column: str = "m_local",
+        m_local_missing_policy: str = "error",
     ):
         if num_images is not None:
             entries = entries[: int(num_images)]
@@ -408,6 +532,10 @@ class ValidationJsonlDataset(Dataset):
         self.resolution = resolution
         self.resolution_mode = resolution_mode
         self.resize = tuple(resize) if resize is not None else None
+        self.load_m_local = load_m_local
+        self.m_local_dirs = m_local_dirs
+        self.m_local_column = m_local_column
+        self.m_local_missing_policy = m_local_missing_policy
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -417,6 +545,17 @@ class ValidationJsonlDataset(Dataset):
         cond = Image.open(item["conditioning_image"]).convert("RGB")
         gt = Image.open(item["image"]).convert("RGB")
         prior = TF.to_pil_image(load_prior_tensor(item["prior"]))
+        if self.load_m_local:
+            resolved_m_local_path = resolve_m_local_path(
+                item,
+                item["conditioning_image"],
+                self.m_local_dirs,
+                self.m_local_column,
+                self.m_local_missing_policy,
+            )
+            m_local = Image.new("L", cond.size, color=0) if resolved_m_local_path is None else load_map_pil(resolved_m_local_path)
+        else:
+            m_local = None
 
         if self.resolution_mode == "square":
             target_size = (self.resolution, self.resolution)
@@ -431,11 +570,17 @@ class ValidationJsonlDataset(Dataset):
             gt = gt.resize(target_size, Image.Resampling.BILINEAR)
         if prior.size != target_size:
             prior = prior.resize(target_size, Image.Resampling.LANCZOS)
+        if m_local is not None and m_local.size != target_size:
+            m_local = m_local.resize(target_size, Image.Resampling.LANCZOS)
 
-        cond = TF.to_tensor(cond)
-        gt = TF.to_tensor(gt)
-        prior = TF.to_tensor(prior)
-        return {"cond": cond, "gt": gt, "prior": prior}
+        result = {
+            "cond": TF.to_tensor(cond),
+            "gt": TF.to_tensor(gt),
+            "prior": TF.to_tensor(prior),
+        }
+        if m_local is not None:
+            result["m_local"] = TF.to_tensor(m_local)
+        return result
 
 
 class FuseDataset(Dataset):
@@ -501,6 +646,8 @@ def infer_diff_prelim(
     prior_tensor: torch.Tensor,
     prompt: str,
     beta: float,
+    m_local_tensor: torch.Tensor | None = None,
+    m_local_lambda: float = 0.5,
 ) -> torch.Tensor:
     device = pipeline._execution_device
     dtype = pipeline.dtype
@@ -544,6 +691,10 @@ def infer_diff_prelim(
 
     prior = prior_tensor.to(device=device, dtype=dtype)
     prior = F.interpolate(prior, size=image.shape[-2:], mode="bilinear", align_corners=False)
+    if m_local_tensor is not None:
+        m_local = m_local_tensor.to(device=device, dtype=dtype)
+        m_local = F.interpolate(m_local, size=image.shape[-2:], mode="bilinear", align_corners=False)
+        prior = (prior + m_local_lambda * m_local).clamp(0.0, 1.0)
     hf_mag = compute_hf_mag(image)
 
     down_block_res_samples, mid_block_res_sample = pipeline.controlnet(
@@ -617,9 +768,18 @@ def gradient_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(pred_dx, gt_dx) + F.l1_loss(pred_dy, gt_dy)
 
 
-def build_refine_input(prelim: torch.Tensor, cond: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+def build_refine_input(
+    prelim: torch.Tensor,
+    cond: torch.Tensor,
+    prior: torch.Tensor,
+    m_local: torch.Tensor | None = None,
+) -> torch.Tensor:
     hf = compute_hf_image(cond)
-    return torch.cat([prelim, hf, prior, cond], dim=1)
+    parts = [prelim, hf, prior]
+    if m_local is not None:
+        parts.append(m_local)
+    parts.append(cond)
+    return torch.cat(parts, dim=1)
 
 
 def apply_refine_residual(
@@ -628,9 +788,10 @@ def apply_refine_residual(
     prelim: torch.Tensor,
     cond: torch.Tensor,
     prior: torch.Tensor,
+    m_local: torch.Tensor | None = None,
     residual_scale: float = 0.1,
 ) -> torch.Tensor:
-    feat = refine_net(build_refine_input(prelim, cond, prior))
+    feat = refine_net(build_refine_input(prelim, cond, prior, m_local))
     residual = torch.tanh(refine_head(feat)) * residual_scale
     return (prelim + residual).clamp(0.0, 1.0)
 
@@ -651,6 +812,8 @@ def log_validation(
         args.validation_resize,
         args.validation_num_images,
     )
+    refine_net_was_training = refine_net.training
+    refine_head_was_training = refine_head.training
     refine_net.eval()
     refine_head.eval()
 
@@ -672,10 +835,28 @@ def log_validation(
             cond = batch["cond"].to(accelerator.device)
             gt = batch["gt"].to(accelerator.device)
             prior = batch["prior"].to(accelerator.device)
+            m_local = batch.get("m_local")
+            if m_local is not None:
+                m_local = m_local.to(accelerator.device)
 
-            prelim_pred = infer_diff_prelim(pipeline, cond, prior, args.prompt, args.beta)
+            prelim_pred = infer_diff_prelim(
+                pipeline,
+                cond,
+                prior,
+                args.prompt,
+                args.beta,
+                m_local_tensor=m_local if args.use_m_local_diffusion else None,
+                m_local_lambda=args.m_local_lambda,
+            )
             prelim = ((prelim_pred + 1.0) / 2.0).clamp(0.0, 1.0)
-            refined = apply_refine_residual(refine_net, refine_head, prelim, cond, prior)
+            refined = apply_refine_residual(
+                refine_net,
+                refine_head,
+                prelim,
+                cond,
+                prior,
+                m_local=m_local if args.use_m_local_refine else None,
+            )
 
             metrics = calculate_validation_metrics(refined, gt, lpips_metric)
             batch_size = cond.shape[0]
@@ -705,8 +886,8 @@ def log_validation(
         avg_metrics["final_score"],
     )
 
-    refine_net.train()
-    refine_head.train()
+    refine_net.train(refine_net_was_training)
+    refine_head.train(refine_head_was_training)
     return {"metrics": avg_metrics, "image_log": image_log}
 
 
@@ -759,6 +940,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         tracker_config = dict(vars(args))
         tracker_config["nafnet_enc_blk_nums"] = ",".join(map(str, args.nafnet_enc_blk_nums))
         tracker_config["nafnet_dec_blk_nums"] = ",".join(map(str, args.nafnet_dec_blk_nums))
+        if tracker_config.get("m_local_dirs") is not None:
+            tracker_config["m_local_dirs"] = ",".join(map(str, tracker_config["m_local_dirs"]))
         tracker_config.pop("multiple_datasets", None)
         tracker_config.pop("multiple_datasets_probabilities", None)
         if args.report_to is not None:
@@ -775,7 +958,16 @@ def main(args: argparse.Namespace | None = None) -> None:
         jsonl_path = os.path.join(args.train_data_dir, name)
         entries = load_jsonl(jsonl_path)
         datasets.append(
-            JsonlDataset(entries, args.resolution, args.resize_scale, args.disable_augment)
+            JsonlDataset(
+                entries,
+                args.resolution,
+                args.resize_scale,
+                args.disable_augment,
+                load_m_local=args.use_m_local_diffusion or args.use_m_local_refine,
+                m_local_dirs=args.m_local_dirs,
+                m_local_column=args.m_local_column,
+                m_local_missing_policy=args.m_local_missing_policy,
+            )
         )
 
     train_dataset = FuseDataset(datasets, probabilities.tolist())
@@ -796,6 +988,10 @@ def main(args: argparse.Namespace | None = None) -> None:
             resolution_mode=args.validation_resolution_mode,
             resize=args.validation_resize,
             num_images=args.validation_num_images,
+            load_m_local=args.use_m_local_diffusion or args.use_m_local_refine,
+            m_local_dirs=args.m_local_dirs,
+            m_local_column=args.m_local_column,
+            m_local_missing_policy=args.m_local_missing_policy,
         )
         val_dataloader = DataLoader(
             val_dataset,
@@ -810,7 +1006,7 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     pipeline = load_pipeline(args, device, dtype)
 
-    in_ch = 10
+    in_ch = 10 + int(args.use_m_local_refine)
     refine_net = NAFNet(
         img_channel=in_ch,
         width=args.nafnet_width,
@@ -824,6 +1020,13 @@ def main(args: argparse.Namespace | None = None) -> None:
     torch.nn.init.zeros_(refine_head.weight)
     torch.nn.init.zeros_(refine_head.bias)
     refine_head.train()
+
+    ema_refine_net = None
+    ema_refine_head = None
+    if args.use_ema:
+        ema_refine_net = clone_ema_module(refine_net)
+        ema_refine_head = clone_ema_module(refine_head)
+        logger.info("Using refine EMA with decay %.6f", args.ema_decay)
 
     lpips_model = lpips.LPIPS(net="alex").to(device)
     lpips_model.eval()
@@ -876,14 +1079,46 @@ def main(args: argparse.Namespace | None = None) -> None:
     logger.info(f"  Num epochs = {args.epochs}")
     logger.info(f"  Max train steps = {max_train_steps}")
 
+    resume_step = 0
+    if args.resume_from_checkpoint:
+        checkpoint_path = Path(args.resume_from_checkpoint)
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = Path(args.output_dir) / checkpoint_path
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"resume_from_checkpoint does not exist: {checkpoint_path}")
+        accelerator.print(f"Resuming refine training from checkpoint: {checkpoint_path}")
+        accelerator.load_state(str(checkpoint_path))
+        if args.use_ema:
+            if load_ema_checkpoint(ema_refine_net, ema_refine_head, checkpoint_path, device):
+                logger.info("Loaded refine EMA weights from %s", checkpoint_path)
+            else:
+                logger.info("No EMA weights found in %s; initializing EMA from resumed refine weights", checkpoint_path)
+                copy_module_state(ema_refine_net, accelerator.unwrap_model(refine_net))
+                copy_module_state(ema_refine_head, accelerator.unwrap_model(refine_head))
+        try:
+            resume_step = int(checkpoint_path.name.split("-")[-1])
+        except ValueError:
+            resume_step = 0
+
     progress_bar = tqdm(
         range(0, max_train_steps),
+        initial=resume_step,
         desc="Steps",
         disable=not accelerator.is_local_main_process,
     )
 
-    global_step = 0
+    global_step = resume_step
+    if resume_step > 0:
+        lr_scheduler.last_epoch = resume_step
+
     best_validation_score = float("-inf")
+    best_metrics_path = Path(args.output_dir) / "best" / "metrics.json"
+    if best_metrics_path.exists():
+        try:
+            best_validation_score = float(json.loads(best_metrics_path.read_text(encoding="utf-8"))["final_score"])
+            logger.info("Loaded existing best refine final_score: %.4f", best_validation_score)
+        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+            logger.warning("Failed to load existing best metrics from %s", best_metrics_path)
     history = create_training_history()
     for epoch in range(args.epochs):
         for step, batch in enumerate(train_dataloader):
@@ -891,6 +1126,9 @@ def main(args: argparse.Namespace | None = None) -> None:
                 cond = batch["cond"].to(device)
                 gt = batch["gt"].to(device)
                 prior = batch["prior"].to(device)
+                m_local = batch.get("m_local")
+                if m_local is not None:
+                    m_local = m_local.to(device)
 
                 with torch.no_grad():
                     prelim_pred = infer_diff_prelim(
@@ -899,10 +1137,19 @@ def main(args: argparse.Namespace | None = None) -> None:
                         prior,
                         args.prompt,
                         args.beta,
+                        m_local_tensor=m_local if args.use_m_local_diffusion else None,
+                        m_local_lambda=args.m_local_lambda,
                     )
                     prelim = ((prelim_pred + 1.0) / 2.0).clamp(0.0, 1.0)
 
-                refined = apply_refine_residual(refine_net, refine_head, prelim, cond, prior)
+                refined = apply_refine_residual(
+                    refine_net,
+                    refine_head,
+                    prelim,
+                    cond,
+                    prior,
+                    m_local=m_local if args.use_m_local_refine else None,
+                )
 
                 l1_val = l1_loss(refined, gt)
                 lpips_val = lpips_model(
@@ -924,10 +1171,15 @@ def main(args: argparse.Namespace | None = None) -> None:
                 progress_bar.update(1)
                 global_step += 1
                 lr_scheduler.step()
+                if args.use_ema:
+                    update_ema_module(ema_refine_net, accelerator.unwrap_model(refine_net), args.ema_decay)
+                    update_ema_module(ema_refine_head, accelerator.unwrap_model(refine_head), args.ema_decay)
                 if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
                     ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     os.makedirs(ckpt_dir, exist_ok=True)
                     accelerator.save_state(ckpt_dir)
+                    if args.use_ema:
+                        save_ema_checkpoint(ema_refine_net, ema_refine_head, ckpt_dir)
 
                     if args.checkpoints_total_limit is not None:
                         checkpoints = [
@@ -948,10 +1200,12 @@ def main(args: argparse.Namespace | None = None) -> None:
                     and val_dataloader is not None
                     and global_step % args.validation_steps == 0
                 ):
+                    validation_refine_net = ema_refine_net if args.use_ema else accelerator.unwrap_model(refine_net)
+                    validation_refine_head = ema_refine_head if args.use_ema else accelerator.unwrap_model(refine_head)
                     validation_output = log_validation(
                         pipeline,
-                        accelerator.unwrap_model(refine_net),
-                        accelerator.unwrap_model(refine_head),
+                        validation_refine_net,
+                        validation_refine_head,
                         val_dataloader,
                         args,
                         accelerator,
@@ -968,7 +1222,10 @@ def main(args: argparse.Namespace | None = None) -> None:
                             "New best refine final_score: %.4f. Saving best refine modules...",
                             best_validation_score,
                         )
-                        save_refine_best_model(refine_net, refine_head, accelerator, args.output_dir, global_step, metrics)
+                        best_refine_net = ema_refine_net if args.use_ema else refine_net
+                        best_refine_head = ema_refine_head if args.use_ema else refine_head
+                        best_accelerator = None if args.use_ema else accelerator
+                        save_refine_best_model(best_refine_net, best_refine_head, best_accelerator, args.output_dir, global_step, metrics)
 
                 if val_dataloader is not None and global_step % args.validation_steps == 0:
                     accelerator.wait_for_everyone()
@@ -1014,16 +1271,34 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        final_net_path = os.path.join(args.output_dir, "nafnet_refine_final.pth")
-        final_head_path = os.path.join(args.output_dir, "nafnet_refine_head_final.pth")
-        torch.save(accelerator.unwrap_model(refine_net).state_dict(), final_net_path)
-        torch.save(accelerator.unwrap_model(refine_head).state_dict(), final_head_path)
+        final_refine_net = ema_refine_net if args.use_ema else refine_net
+        final_refine_head = ema_refine_head if args.use_ema else refine_head
+        final_accelerator = None if args.use_ema else accelerator
+        save_refine_modules(
+            final_refine_net,
+            final_refine_head,
+            args.output_dir,
+            net_name="nafnet_refine_final.pth",
+            head_name="nafnet_refine_head_final.pth",
+            accelerator=final_accelerator,
+        )
+        if args.use_ema:
+            save_refine_modules(
+                refine_net,
+                refine_head,
+                args.output_dir,
+                net_name="nafnet_refine_raw_final.pth",
+                head_name="nafnet_refine_head_raw_final.pth",
+                accelerator=accelerator,
+            )
 
         if val_dataloader is not None:
+            validation_refine_net = ema_refine_net if args.use_ema else accelerator.unwrap_model(refine_net)
+            validation_refine_head = ema_refine_head if args.use_ema else accelerator.unwrap_model(refine_head)
             validation_output = log_validation(
                 pipeline,
-                accelerator.unwrap_model(refine_net),
-                accelerator.unwrap_model(refine_head),
+                validation_refine_net,
+                validation_refine_head,
                 val_dataloader,
                 args,
                 accelerator,
@@ -1035,7 +1310,10 @@ def main(args: argparse.Namespace | None = None) -> None:
             update_training_history(history, "validation", global_step, metrics)
             save_training_history(history, args.output_dir)
             if metrics["final_score"] > best_validation_score:
-                save_refine_best_model(refine_net, refine_head, accelerator, args.output_dir, global_step, metrics)
+                best_refine_net = ema_refine_net if args.use_ema else refine_net
+                best_refine_head = ema_refine_head if args.use_ema else refine_head
+                best_accelerator = None if args.use_ema else accelerator
+                save_refine_best_model(best_refine_net, best_refine_head, best_accelerator, args.output_dir, global_step, metrics)
 
 
 if __name__ == "__main__":

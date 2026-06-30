@@ -17,6 +17,7 @@ from torchvision.transforms import functional as TF
 from tqdm.auto import tqdm
 
 from basicsr.models.archs.NAFNet_arch import NAFNet
+from fumo_mlocal import load_map_tensor, resolve_m_local_path
 from fumo_refine_common import apply_refine_residual, infer_diff_prelim, load_pipeline, load_prior_tensor
 
 
@@ -26,7 +27,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run full FUMO inference with matched LQ/P_int files.")
     parser.add_argument("--baseline_config", default="config/baseline.yaml")
-    parser.add_argument("--refine_config", default="config/refine_baseline.yaml")
+    parser.add_argument("--refine_config", default="config/refine.yaml")
     parser.add_argument("--input_dir", default=None, help="Directory containing LQ images.")
     parser.add_argument("--prior_dir", default=None, help="Directory containing P_int .npy files.")
     parser.add_argument("--output_dir", default="results/inference", help="Output directory under results.")
@@ -43,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolution_mode", default="square", choices=["square", "full"])
     parser.add_argument("--resize", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--beta", type=float, default=None)
+    parser.add_argument("--use_m_local_diffusion", action="store_true", default=None)
+    parser.add_argument("--use_m_local_refine", action="store_true", default=None)
+    parser.add_argument("--m_local_dirs", type=str, nargs="*", default=None)
+    parser.add_argument("--m_local_column", default=None)
+    parser.add_argument("--m_local_lambda", type=float, default=None)
+    parser.add_argument("--m_local_missing_policy", default=None, choices=["error", "zero"])
     parser.add_argument("--residual_scale", type=float, default=0.1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="fp32", choices=["fp32", "fp16", "bf16"])
@@ -55,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_input", action="store_true")
     parser.add_argument("--save_original_size", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument(
+        "--tta",
+        default="none",
+        choices=["none", "d4"],
+        help="Test-time augmentation. d4 runs 4 rotations x horizontal flip and averages inverse-transformed outputs.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--shard_id", type=int, default=0)
@@ -91,7 +104,7 @@ def shard_items(items: list[Path], num_shards: int, shard_id: int) -> list[Path]
 
 def find_latest_refine_dir(outputs_dir: Path) -> Path | None:
     candidates = []
-    for run_dir in outputs_dir.glob("refine_baseline_*"):
+    for run_dir in outputs_dir.glob("refine_*"):
         best = run_dir / "best"
         if (best / "nafnet_refine.pth").exists() and (best / "nafnet_refine_head.pth").exists():
             candidates.append(run_dir)
@@ -141,7 +154,7 @@ def dtype_from_arg(value: str) -> torch.dtype:
 
 
 def load_refine_models(args: argparse.Namespace, net_path: Path, head_path: Path, device: torch.device):
-    in_ch = 10
+    in_ch = 10 + int(getattr(args, "use_m_local_refine", False))
     refine_net = NAFNet(
         img_channel=in_ch,
         width=args.nafnet_width,
@@ -151,8 +164,14 @@ def load_refine_models(args: argparse.Namespace, net_path: Path, head_path: Path
     ).to(device)
     refine_head = torch.nn.Conv2d(in_ch, 3, kernel_size=1, bias=True).to(device)
 
-    refine_net.load_state_dict(torch.load(net_path, map_location="cpu"))
-    refine_head.load_state_dict(torch.load(head_path, map_location="cpu"))
+    try:
+        refine_net.load_state_dict(torch.load(net_path, map_location="cpu"))
+        refine_head.load_state_dict(torch.load(head_path, map_location="cpu"))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load refine checkpoint with in_ch={in_ch}. "
+            "Check that use_m_local_refine matches the checkpoint (10ch off, 11ch on)."
+        ) from exc
     refine_net.eval()
     refine_head.eval()
     return refine_net, refine_head
@@ -181,6 +200,119 @@ def tensor_to_image(tensor: torch.Tensor, original_size: tuple[int, int] | None 
     if original_size is not None and image.size != original_size:
         image = image.resize(original_size, Image.Resampling.BILINEAR)
     return image
+
+
+def apply_d4_transform(tensor: torch.Tensor, rotation: int, hflip: bool) -> torch.Tensor:
+    output = torch.rot90(tensor, k=rotation, dims=(-2, -1))
+    if hflip:
+        output = torch.flip(output, dims=(-1,))
+    return output
+
+
+def invert_d4_transform(tensor: torch.Tensor, rotation: int, hflip: bool) -> torch.Tensor:
+    output = tensor
+    if hflip:
+        output = torch.flip(output, dims=(-1,))
+    return torch.rot90(output, k=(-rotation) % 4, dims=(-2, -1))
+
+
+def d4_variants() -> list[tuple[int, bool]]:
+    return [(rotation, hflip) for rotation in range(4) for hflip in (False, True)]
+
+
+def infer_one(
+    pipeline,
+    refine_net,
+    refine_head,
+    cond: torch.Tensor,
+    prior: torch.Tensor,
+    m_local: torch.Tensor | None,
+    prompt: str,
+    beta: float,
+    residual_scale: float,
+    use_m_local_diffusion: bool,
+    use_m_local_refine: bool,
+    m_local_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    prelim_pred = infer_diff_prelim(
+        pipeline,
+        cond,
+        prior,
+        prompt,
+        beta,
+        m_local_tensor=m_local if use_m_local_diffusion else None,
+        m_local_lambda=m_local_lambda,
+    )
+    prelim = ((prelim_pred + 1.0) / 2.0).clamp(0.0, 1.0).float()
+    refined = apply_refine_residual(
+        refine_net,
+        refine_head,
+        prelim,
+        cond.float(),
+        prior.float(),
+        m_local=m_local.float() if (use_m_local_refine and m_local is not None) else None,
+        residual_scale=residual_scale,
+    )
+    return prelim, refined
+
+
+def infer_with_tta(
+    pipeline,
+    refine_net,
+    refine_head,
+    cond: torch.Tensor,
+    prior: torch.Tensor,
+    m_local: torch.Tensor | None,
+    prompt: str,
+    beta: float,
+    residual_scale: float,
+    tta: str,
+    use_m_local_diffusion: bool,
+    use_m_local_refine: bool,
+    m_local_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if tta == "none":
+        return infer_one(
+            pipeline,
+            refine_net,
+            refine_head,
+            cond,
+            prior,
+            m_local,
+            prompt,
+            beta,
+            residual_scale,
+            use_m_local_diffusion,
+            use_m_local_refine,
+            m_local_lambda,
+        )
+
+    prelim_outputs = []
+    refined_outputs = []
+    for rotation, hflip in d4_variants():
+        cond_aug = apply_d4_transform(cond, rotation, hflip)
+        prior_aug = apply_d4_transform(prior, rotation, hflip)
+        m_local_aug = apply_d4_transform(m_local, rotation, hflip) if m_local is not None else None
+        prelim_aug, refined_aug = infer_one(
+            pipeline,
+            refine_net,
+            refine_head,
+            cond_aug,
+            prior_aug,
+            m_local_aug,
+            prompt,
+            beta,
+            residual_scale,
+            use_m_local_diffusion,
+            use_m_local_refine,
+            m_local_lambda,
+        )
+        prelim_outputs.append(invert_d4_transform(prelim_aug, rotation, hflip))
+        refined_outputs.append(invert_d4_transform(refined_aug, rotation, hflip))
+
+    prelim = torch.stack(prelim_outputs, dim=0).mean(dim=0).clamp(0.0, 1.0)
+    refined = torch.stack(refined_outputs, dim=0).mean(dim=0).clamp(0.0, 1.0)
+    return prelim, refined
 
 
 def save_metadata(output_root: Path, payload: dict) -> None:
@@ -220,6 +352,12 @@ def main() -> None:
     if args.resize is not None:
         args.resize = tuple(int(v) for v in args.resize)
     args.beta = float(first_existing(args.beta, stage2.get("beta"), stage1.get("beta_max"), 0.25))
+    args.use_m_local_diffusion = bool(first_existing(args.use_m_local_diffusion, stage2.get("use_m_local_diffusion"), stage1.get("use_m_local_diffusion"), False))
+    args.use_m_local_refine = bool(first_existing(args.use_m_local_refine, stage2.get("use_m_local_refine"), False))
+    args.m_local_dirs = first_existing(args.m_local_dirs, refine_paths.get("m_local_dirs"), baseline_paths.get("m_local_dirs"), [])
+    args.m_local_column = first_existing(args.m_local_column, stage2.get("m_local_column"), stage1.get("m_local_column"), "m_local")
+    args.m_local_lambda = float(first_existing(args.m_local_lambda, stage2.get("m_local_lambda"), stage1.get("m_local_lambda"), 0.5))
+    args.m_local_missing_policy = first_existing(args.m_local_missing_policy, stage2.get("m_local_missing_policy"), stage1.get("m_local_missing_policy"), "error")
     args.nafnet_width = int(first_existing(args.nafnet_width, stage2.get("nafnet_width"), 64))
     args.nafnet_middle_blk_num = int(first_existing(args.nafnet_middle_blk_num, stage2.get("nafnet_middle_blk_num"), 1))
     args.nafnet_enc_blk_nums = first_existing(args.nafnet_enc_blk_nums, stage2.get("nafnet_enc_blk_nums"), [1, 1, 1, 28])
@@ -275,6 +413,8 @@ def main() -> None:
     print(f"Refine head: {head_path}")
     print(f"Images: {len(images)} shard {args.shard_id}/{args.num_shards}")
     print(f"Resolution mode: {args.resolution_mode} resize={args.resize} processing_resolution={args.resolution}")
+    print(f"M_local diffusion: {args.use_m_local_diffusion} refine: {args.use_m_local_refine} lambda={args.m_local_lambda}")
+    print(f"TTA: {args.tta}")
 
     save_metadata(
         run_root,
@@ -292,8 +432,14 @@ def main() -> None:
             "resolution_mode": args.resolution_mode,
             "resize": args.resize,
             "beta": args.beta,
+            "use_m_local_diffusion": args.use_m_local_diffusion,
+            "use_m_local_refine": args.use_m_local_refine,
+            "m_local_dirs": [str(path) for path in args.m_local_dirs],
+            "m_local_lambda": args.m_local_lambda,
+            "m_local_missing_policy": args.m_local_missing_policy,
             "residual_scale": args.residual_scale,
             "dtype": args.dtype,
+            "tta": args.tta,
             "num_shards": args.num_shards,
             "shard_id": args.shard_id,
         },
@@ -337,21 +483,44 @@ def main() -> None:
                 mode="bilinear",
                 align_corners=False,
             )
+            m_local = None
+            if args.use_m_local_diffusion or args.use_m_local_refine:
+                resolved_m_local_path = resolve_m_local_path(
+                    {},
+                    image_path,
+                    args.m_local_dirs,
+                    args.m_local_column,
+                    args.m_local_missing_policy,
+                )
+                if resolved_m_local_path is None:
+                    m_local = torch.zeros_like(prior)
+                else:
+                    m_local = load_map_tensor(resolved_m_local_path).unsqueeze(0)
+                    m_local = torch.nn.functional.interpolate(
+                        m_local,
+                        size=cond.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
             cond = cond.to(device=device)
             prior = prior.to(device=device)
+            if m_local is not None:
+                m_local = m_local.to(device=device)
 
-            prelim_pred = infer_diff_prelim(pipeline, cond, prior, args.prompt, args.beta)
-            prelim = ((prelim_pred + 1.0) / 2.0).clamp(0.0, 1.0)
-            prelim = prelim.float()
-            cond = cond.float()
-            prior = prior.float()
-            refined = apply_refine_residual(
+            prelim, refined = infer_with_tta(
+                pipeline,
                 refine_net,
                 refine_head,
-                prelim,
                 cond,
                 prior,
-                residual_scale=args.residual_scale,
+                m_local,
+                args.prompt,
+                args.beta,
+                args.residual_scale,
+                args.tta,
+                args.use_m_local_diffusion,
+                args.use_m_local_refine,
+                args.m_local_lambda,
             )
 
             target_size = original_size if args.save_original_size else None

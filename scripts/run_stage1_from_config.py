@@ -110,6 +110,7 @@ def main():
     add_arg(train_args, "multiple_datasets_probabilities", dataset_probabilities)
     add_arg(train_args, "validation_jsonl", validation_jsonl)
     add_arg(train_args, "output_dir", output_dir)
+    add_arg(train_args, "m_local_dirs", paths.get("m_local_dirs"))
 
     for key in (
         "resolution",
@@ -121,6 +122,9 @@ def main():
         "checkpointing_steps",
         "log_interval",
         "checkpoints_total_limit",
+        "use_controlnet_ema",
+        "use_unet_ema",
+        "ema_decay",
         "validation_steps",
         "num_validation_images",
         "validation_example_index",
@@ -133,6 +137,10 @@ def main():
         "beta_max",
         "beta_warmup_ratio",
         "shrink_prob",
+        "use_m_local_diffusion",
+        "m_local_column",
+        "m_local_lambda",
+        "m_local_missing_policy",
         "seed",
         "enable_xformers_memory_efficient_attention",
         "gradient_checkpointing",

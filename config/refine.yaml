@@ -1,15 +1,18 @@
 experiment:
-  name: refine_sd21_qwen3
+  name: refine_outdoor_50_m_local
   prompt: remove degradation
 
 paths:
-  json_dir: /home/student_1/LoViF/FUMO/json/qwen3_vl_8b
-  train_jsonl: baseline_train.jsonl
-  validation_jsonl: /home/student_1/LoViF/FUMO/json/qwen3_vl_8b/baseline_val.jsonl
+  json_dir: /home/student_1/LoViF/FUMO/json/lovif_qwen25_rrw_outdoor_50
+  train_jsonl: train.jsonl
+  validation_jsonl: /home/student_1/LoViF/FUMO/json/lovif_qwen25_rrw_outdoor_50/baseline_val.jsonl
   output_dir: /home/student_1/LoViF/FUMO/outputs
-  pretrained_model_name_or_path: sd2-community/stable-diffusion-2-1
-  controlnet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_sd21_qwen3_20260627_181616/best/controlnet
-  unet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_sd21_qwen3_20260627_181616/best/unet
+  m_local_dirs:
+    - /home/student_1/LoViF/MaxRF/results/RRW/m_local
+    - /home/student_1/LoViF/MaxRF/results/LQ_RaindropRemoval_WeatherRemoval_train/m_local
+  pretrained_model_name_or_path: Manojb/stable-diffusion-2-1-base
+  controlnet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_rrw_outdoor_50_m_local_20260629_170118/best/controlnet
+  unet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_rrw_outdoor_50_m_local_20260629_170118/best/unet
 
 stage2:
   multiple_datasets_probabilities: [1.0]
@@ -40,11 +43,14 @@ stage2:
   nafnet_enc_blk_nums: [1, 1, 1, 28]
   nafnet_dec_blk_nums: [1, 1, 1, 1]
   beta: 0.25
+  use_m_local_diffusion: true
+  use_m_local_refine: true
+  m_local_lambda: 0.5
+  m_local_missing_policy: error
   seed: 42
 
 validation:
   enabled: true
-  # DiffUR3-style sampling validation: run full-image inference, then score against GT at the same size.
   resolution_mode: full
   resize: [1080, 720]
   num_images: null

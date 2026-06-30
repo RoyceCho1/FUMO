@@ -14,6 +14,7 @@
 
 import argparse
 import contextlib
+import copy
 import gc
 import json
 import logging
@@ -58,6 +59,7 @@ from diffusers.utils.torch_utils import is_compiled_module
 from diffusion.controlnetvae import ControlNetVAEModel
 
 from diffusion.pipeline_onestep import OneStepPipeline
+from fumo_mlocal import load_map_array, load_map_pil, normalize_map_array, resolve_m_local_path
 from wavelet_color_fix import wavelet_decomposition
 
 
@@ -177,16 +179,75 @@ def calculate_validation_metrics(pred: torch.Tensor, target: torch.Tensor, lpips
     }
 
 
+def unwrap_for_save(model, accelerator=None):
+    if accelerator is not None:
+        model = accelerator.unwrap_model(model)
+    return model._orig_mod if is_compiled_module(model) else model
+
+
+def save_stage1_modules(controlnet, unet, output_dir: str | Path, accelerator=None) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    unwrap_for_save(controlnet, accelerator).save_pretrained(output_dir / "controlnet")
+    unwrap_for_save(unet, accelerator).save_pretrained(output_dir / "unet")
+
+
 def save_stage1_best_model(controlnet, unet, accelerator, output_dir: str, step: int, metrics: dict) -> None:
     best_dir = Path(output_dir) / "best"
-    controlnet_dir = best_dir / "controlnet"
-    unet_dir = best_dir / "unet"
-    best_dir.mkdir(parents=True, exist_ok=True)
-    accelerator.unwrap_model(controlnet).save_pretrained(controlnet_dir)
-    accelerator.unwrap_model(unet).save_pretrained(unet_dir)
-    payload = {"step": step, **{key: float(value) for key, value in metrics.items()}}
+    save_stage1_modules(controlnet, unet, best_dir, accelerator=accelerator)
+    payload = {"step": int(step), **{key: float(value) for key, value in metrics.items()}}
     with open(best_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def clone_ema_module(module):
+    ema_module = copy.deepcopy(module)
+    ema_module.eval()
+    for parameter in ema_module.parameters():
+        parameter.requires_grad_(False)
+    return ema_module
+
+
+@torch.no_grad()
+def copy_module_state(target, source) -> None:
+    target.load_state_dict(source.state_dict())
+
+
+@torch.no_grad()
+def update_ema_module(ema_module, source_module, decay: float) -> None:
+    ema_state = ema_module.state_dict()
+    source_state = source_module.state_dict()
+    for key, ema_value in ema_state.items():
+        source_value = source_state[key].detach()
+        if torch.is_floating_point(ema_value):
+            ema_value.mul_(decay).add_(source_value.to(device=ema_value.device, dtype=ema_value.dtype), alpha=1.0 - decay)
+        else:
+            ema_value.copy_(source_value.to(device=ema_value.device))
+
+
+def save_diffusion_ema_checkpoint(ema_controlnet, ema_unet, checkpoint_dir: str | Path) -> None:
+    checkpoint_dir = Path(checkpoint_dir)
+    if ema_controlnet is not None:
+        ema_controlnet.save_pretrained(checkpoint_dir / "controlnet_ema")
+    if ema_unet is not None:
+        ema_unet.save_pretrained(checkpoint_dir / "unet_ema")
+
+
+def load_diffusion_ema_checkpoint(ema_controlnet, ema_unet, checkpoint_dir: str | Path, torch_dtype=None) -> tuple[bool, bool]:
+    checkpoint_dir = Path(checkpoint_dir)
+    loaded_controlnet = False
+    loaded_unet = False
+    if ema_controlnet is not None and (checkpoint_dir / "controlnet_ema").exists():
+        loaded = ControlNetVAEModel.from_pretrained(checkpoint_dir / "controlnet_ema", torch_dtype=torch_dtype)
+        ema_controlnet.load_state_dict(loaded.state_dict())
+        del loaded
+        loaded_controlnet = True
+    if ema_unet is not None and (checkpoint_dir / "unet_ema").exists():
+        loaded = UNet2DConditionModel.from_pretrained(checkpoint_dir / "unet_ema", torch_dtype=torch_dtype)
+        ema_unet.load_state_dict(loaded.state_dict())
+        del loaded
+        loaded_unet = True
+    return loaded_controlnet, loaded_unet
 
 
 def create_training_history() -> dict:
@@ -341,7 +402,24 @@ def log_validation(
 
         validation_image = Image.open(validation_image_path).convert("RGB")
         gt_image = Image.open(gt_image_path).convert("RGB")
-        prior = np.load(prior_path) if prior_path else None
+        prior = normalize_map_array(np.load(prior_path)) if prior_path else None
+        if args.use_m_local_diffusion and prior is not None:
+            resolved_m_local_path = resolve_m_local_path(
+                data,
+                validation_image_path,
+                args.m_local_dirs,
+                args.m_local_column,
+                args.m_local_missing_policy,
+            )
+            if resolved_m_local_path is None:
+                m_local = np.zeros_like(prior, dtype=np.float32)
+            else:
+                m_local = load_map_array(resolved_m_local_path)
+                if m_local.shape != prior.shape:
+                    m_local_img = Image.fromarray((m_local * 255.0).astype(np.uint8), mode="L")
+                    m_local_img = m_local_img.resize((prior.shape[1], prior.shape[0]), Image.Resampling.LANCZOS)
+                    m_local = np.asarray(m_local_img, dtype=np.float32) / 255.0
+            prior = np.clip(prior + args.m_local_lambda * m_local, 0.0, 1.0)
 
         images = []
         with inference_ctx:
@@ -562,6 +640,9 @@ def parse_args(input_args=None):
         default=None,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
+    parser.add_argument("--use_controlnet_ema", action="store_true", help="Maintain EMA weights for ControlNet and use them for validation/best/final saving.")
+    parser.add_argument("--use_unet_ema", action="store_true", help="Maintain EMA weights for UNet and use them for validation/best/final saving.")
+    parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay for diffusion modules.")
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -752,6 +833,37 @@ def parse_args(input_args=None):
         help="The column of the dataset containing a prior npy path.",
     )
     parser.add_argument(
+        "--m_local_column",
+        type=str,
+        default="m_local",
+        help="The column of the dataset containing an optional M_local npy path.",
+    )
+    parser.add_argument(
+        "--m_local_dirs",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Directories searched by conditioning image stem for M_local npy files.",
+    )
+    parser.add_argument(
+        "--use_m_local_diffusion",
+        action="store_true",
+        help="Use M_local to build the effective diffusion gate prior.",
+    )
+    parser.add_argument(
+        "--m_local_lambda",
+        type=float,
+        default=0.5,
+        help="Weight applied to M_local before adding it to the intensity prior.",
+    )
+    parser.add_argument(
+        "--m_local_missing_policy",
+        type=str,
+        default="error",
+        choices=["error", "zero"],
+        help="How to handle missing M_local maps when M_local is enabled.",
+    )
+    parser.add_argument(
         "--caption_column",
         type=str,
         default="text",
@@ -916,6 +1028,14 @@ def parse_args(input_args=None):
 
     return args
 
+class RandomRotate90:
+    def __call__(self, image):
+        k = int(torch.randint(0, 4, (1,)).item())
+        if k == 0:
+            return image
+        return image.rotate(90 * k, expand=False)
+
+
 class FuseDataset(torch.utils.data.Dataset):
     def __init__(self, datasets, probabilities, train_args):
         self.datasets = datasets
@@ -939,6 +1059,7 @@ class FuseDataset(torch.utils.data.Dataset):
                 transforms.RandomCrop(self.args.resolution),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
+                RandomRotate90(),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
@@ -947,6 +1068,7 @@ class FuseDataset(torch.utils.data.Dataset):
                 transforms.RandomCrop(self.args.resolution),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
+                RandomRotate90(),
                 transforms.ToTensor(),
             ])
 
@@ -971,12 +1093,27 @@ class FuseDataset(torch.utils.data.Dataset):
         prior = np.nan_to_num(prior, nan=0.0, posinf=1.0, neginf=0.0)
         prior = np.clip(prior.astype(np.float32), 0.0, 1.0)
         prior = Image.fromarray((prior * 255.0).astype(np.uint8), mode="L")
+        if self.args.use_m_local_diffusion:
+            resolved_m_local_path = resolve_m_local_path(
+                item,
+                conditioning_image_path,
+                self.args.m_local_dirs,
+                self.args.m_local_column,
+                self.args.m_local_missing_policy,
+            )
+            m_local = Image.new("L", conditioning_image.size, color=0) if resolved_m_local_path is None else load_map_pil(resolved_m_local_path)
+        else:
+            m_local = None
 
         image = self.resize_transform(image)
         conditioning_image = self.resize_transform(conditioning_image)
         prior = self.resize_transform(prior)
+        if m_local is not None:
+            m_local = self.resize_transform(m_local)
         if prior.size != conditioning_image.size:
             prior = prior.resize(conditioning_image.size, Image.Resampling.LANCZOS)
+        if m_local is not None and m_local.size != conditioning_image.size:
+            m_local = m_local.resize(conditioning_image.size, Image.Resampling.LANCZOS)
 
         seed = torch.random.seed()
         torch.manual_seed(seed)
@@ -985,13 +1122,19 @@ class FuseDataset(torch.utils.data.Dataset):
         conditioning_image = self.image_transforms(conditioning_image)
         torch.manual_seed(seed)
         prior = self.prior_transforms(prior)
+        if m_local is not None:
+            torch.manual_seed(seed)
+            m_local = self.prior_transforms(m_local)
 
-        return {
+        result = {
             "pixel_values": image,
             "conditioning_pixel_values": conditioning_image,
             "prior": prior,
             "input_ids": item["input_ids"],
         }
+        if m_local is not None:
+            result["m_local"] = m_local
+        return result
 
 def make_train_dataset(args, tokenizer, accelerator):
     datasets = []
@@ -1010,6 +1153,7 @@ def make_train_dataset(args, tokenizer, accelerator):
         caption_column = args.caption_column if args.caption_column in column_names else column_names[1]
         conditioning_image_column = args.conditioning_image_column if args.conditioning_image_column in column_names else column_names[2]
         prior_column = args.prior_column if args.prior_column in column_names else "prior"
+        m_local_column = args.m_local_column if args.m_local_column in column_names else None
 
         def tokenize_captions(examples, is_train=True):
             captions = []
@@ -1029,6 +1173,8 @@ def make_train_dataset(args, tokenizer, accelerator):
             examples["image_path"] = examples[image_column]
             examples["conditioning_image_path"] = examples[conditioning_image_column]
             examples["prior_path"] = examples[prior_column]
+            if args.use_m_local_diffusion:
+                examples["m_local_path"] = examples[m_local_column] if m_local_column is not None else [None] * len(examples[conditioning_image_column])
             examples["input_ids"] = tokenize_captions(examples)
             return examples
 
@@ -1052,12 +1198,16 @@ def collate_fn(examples):
 
     input_ids = torch.stack([example["input_ids"] for example in examples])
 
-    return {
+    batch = {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prior": prior,
         "input_ids": input_ids,
     }
+    if "m_local" in examples[0]:
+        m_local = torch.stack([example["m_local"] for example in examples])
+        batch["m_local"] = m_local.to(memory_format=torch.contiguous_format).float()
+    return batch
 
 
 def main(args):
@@ -1169,10 +1319,14 @@ def main(args):
                 # pop models so that they are not loaded again
                 model = models.pop()
 
-                # load diffusers style into model
-                load_model = ControlNetVAEModel.from_pretrained(input_dir, subfolder="controlnet")
-                model.register_to_config(**load_model.config)
+                if isinstance(model, ControlNetVAEModel):
+                    load_model = ControlNetVAEModel.from_pretrained(input_dir, subfolder="controlnet")
+                elif isinstance(model, UNet2DConditionModel):
+                    load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                else:
+                    raise ValueError(f"Unsupported model type in checkpoint load hook: {type(model)}")
 
+                model.register_to_config(**load_model.config)
                 model.load_state_dict(load_model.state_dict())
                 del load_model
 
@@ -1297,6 +1451,15 @@ def main(args):
     # unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
+    ema_controlnet = None
+    ema_unet = None
+    if args.use_controlnet_ema:
+        ema_controlnet = clone_ema_module(unwrap_model(controlnet)).to(accelerator.device)
+        logger.info("Using ControlNet EMA with decay %.6f", args.ema_decay)
+    if args.use_unet_ema:
+        ema_unet = clone_ema_module(unwrap_model(unet)).to(accelerator.device)
+        logger.info("Using UNet EMA with decay %.6f", args.ema_decay)
+
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -1316,6 +1479,8 @@ def main(args):
 
         tracker_config.pop("multiple_datasets")
         tracker_config.pop("multiple_datasets_probabilities")
+        if tracker_config.get("m_local_dirs") is not None:
+            tracker_config["m_local_dirs"] = ",".join(map(str, tracker_config["m_local_dirs"]))
 
         if args.report_to is not None:
             accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
@@ -1355,7 +1520,21 @@ def main(args):
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            checkpoint_path = os.path.join(args.output_dir, path)
+            accelerator.load_state(checkpoint_path)
+            if args.use_controlnet_ema or args.use_unet_ema:
+                loaded_controlnet_ema, loaded_unet_ema = load_diffusion_ema_checkpoint(
+                    ema_controlnet,
+                    ema_unet,
+                    checkpoint_path,
+                    torch_dtype=torch.float32,
+                )
+                if args.use_controlnet_ema and not loaded_controlnet_ema:
+                    logger.info("No ControlNet EMA found in %s; initializing from resumed ControlNet weights", checkpoint_path)
+                    copy_module_state(ema_controlnet, unwrap_model(controlnet))
+                if args.use_unet_ema and not loaded_unet_ema:
+                    logger.info("No UNet EMA found in %s; initializing from resumed UNet weights", checkpoint_path)
+                    copy_module_state(ema_unet, unwrap_model(unet))
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
@@ -1409,8 +1588,10 @@ def main(args):
                 cond_latents = vae.encode(controlnet_image).latent_dist.sample()
                 cond_latents = cond_latents * vae.config.scaling_factor
 
-                prior_map = batch["prior"].to(dtype=weight_dtype)
-                prior_map = prior_map.clamp(0.0, 1.0)
+                prior_map = batch["prior"].to(dtype=weight_dtype).clamp(0.0, 1.0)
+                if args.use_m_local_diffusion:
+                    m_local_map = batch["m_local"].to(dtype=weight_dtype).clamp(0.0, 1.0)
+                    prior_map = (prior_map + args.m_local_lambda * m_local_map).clamp(0.0, 1.0)
 
                 hf_mag = compute_hf_mag(controlnet_image)
 
@@ -1464,6 +1645,11 @@ def main(args):
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
+                if accelerator.sync_gradients:
+                    if args.use_controlnet_ema:
+                        update_ema_module(ema_controlnet, unwrap_model(controlnet), args.ema_decay)
+                    if args.use_unet_ema:
+                        update_ema_module(ema_unet, unwrap_model(unet), args.ema_decay)
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
 
@@ -1496,15 +1682,19 @@ def main(args):
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
+                        if args.use_controlnet_ema or args.use_unet_ema:
+                            save_diffusion_ema_checkpoint(ema_controlnet, ema_unet, save_path)
                         logger.info(f"Saved state to {save_path}")
 
                     if args.validation_jsonl is not None and global_step % args.validation_steps == 0:
+                        validation_unet = ema_unet if args.use_unet_ema else unet
+                        validation_controlnet = ema_controlnet if args.use_controlnet_ema else controlnet
                         validation_output = log_validation(
                             vae,
                             text_encoder,
                             tokenizer,
-                            unet,
-                            controlnet,
+                            validation_unet,
+                            validation_controlnet,
                             args,
                             accelerator,
                             weight_dtype,
@@ -1519,7 +1709,9 @@ def main(args):
                         if metrics is not None and metrics["final_score"] > best_validation_score:
                             best_validation_score = metrics["final_score"]
                             logger.info("New best final_score: %.4f. Saving best Stage 1 modules...", best_validation_score)
-                            save_stage1_best_model(controlnet, unet, accelerator, args.output_dir, global_step, metrics)
+                            best_controlnet = ema_controlnet if args.use_controlnet_ema else unwrap_model(controlnet)
+                            best_unet = ema_unet if args.use_unet_ema else unwrap_model(unet)
+                            save_stage1_best_model(best_controlnet, best_unet, None, args.output_dir, global_step, metrics)
 
                 if args.validation_jsonl is not None and global_step % args.validation_steps == 0:
                     accelerator.wait_for_everyone()
@@ -1544,10 +1736,12 @@ def main(args):
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        controlnet = unwrap_model(controlnet)
-        controlnet.save_pretrained(os.path.join(args.output_dir, 'controlnet'))
-        unet = unwrap_model(unet)
-        unet.save_pretrained(os.path.join(args.output_dir, 'unet'))
+        final_controlnet = ema_controlnet if args.use_controlnet_ema else unwrap_model(controlnet)
+        final_unet = ema_unet if args.use_unet_ema else unwrap_model(unet)
+        save_stage1_modules(final_controlnet, final_unet, args.output_dir, accelerator=None)
+        if args.use_controlnet_ema or args.use_unet_ema:
+            raw_dir = Path(args.output_dir) / "raw_final"
+            save_stage1_modules(unwrap_model(controlnet), unwrap_model(unet), raw_dir, accelerator=None)
 
         # Run a final round of validation.
         image_logs = None
@@ -1573,7 +1767,9 @@ def main(args):
             if metrics is not None and metrics["final_score"] > best_validation_score:
                 best_validation_score = metrics["final_score"]
                 logger.info("New best final_score: %.4f. Saving best Stage 1 modules...", best_validation_score)
-                save_stage1_best_model(controlnet, unet, accelerator, args.output_dir, global_step, metrics)
+                best_controlnet = ema_controlnet if args.use_controlnet_ema else final_controlnet
+                best_unet = ema_unet if args.use_unet_ema else final_unet
+                save_stage1_best_model(best_controlnet, best_unet, None, args.output_dir, global_step, metrics)
 
         if args.push_to_hub:
             save_model_card(

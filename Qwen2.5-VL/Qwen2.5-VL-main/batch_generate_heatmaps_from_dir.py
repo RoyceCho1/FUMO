@@ -32,7 +32,7 @@ except ImportError:
 # =========================
 # Config (edit as needed)
 # =========================
-INPUT_DIR = "/home/student_1/LoViF/FUMO/data/RRW_outdoor_50/LQ"
+INPUT_DIR = "/home/student_1/LoViF/LOVIF_repo/data/RRW/outdoor_50/LQ"
 OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/RRW_outdoor_50/Qwen2.5-VL-7B/P_int"
 GRAY_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/RRW_outdoor_50/Qwen2.5-VL-7B/P_int_gray"
 HEATMAP_OUTPUT_DIR = "/home/student_1/LoViF/FUMO/results/RRW_outdoor_50/Qwen2.5-VL-7B/P_int_heatmap"

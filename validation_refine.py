@@ -35,7 +35,7 @@ from fumo_refine_common import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate FUMO refine output on a JSONL split.")
     parser.add_argument("--baseline_config", default="config/baseline.yaml")
-    parser.add_argument("--refine_config", default="config/refine_baseline.yaml")
+    parser.add_argument("--refine_config", default="config/refine.yaml")
     parser.add_argument("--validation_jsonl", default=None)
     parser.add_argument("--output_dir", default="results/validation_refine")
     parser.add_argument("--run_name", default=None)
@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--example_index", type=int, default=0)
     parser.add_argument("--beta", type=float, default=None)
+    parser.add_argument("--use_m_local_diffusion", action="store_true", default=None)
+    parser.add_argument("--use_m_local_refine", action="store_true", default=None)
+    parser.add_argument("--m_local_dirs", type=str, nargs="*", default=None)
+    parser.add_argument("--m_local_column", default=None)
+    parser.add_argument("--m_local_lambda", type=float, default=None)
+    parser.add_argument("--m_local_missing_policy", default=None, choices=["error", "zero"])
     parser.add_argument("--residual_scale", type=float, default=0.1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="fp32", choices=["fp32", "fp16", "bf16"])
@@ -96,6 +102,12 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     args.batch_size = int(first_existing(args.batch_size, validation.get("batch_size"), stage2.get("validation_batch_size"), 1))
     args.num_workers = int(first_existing(args.num_workers, validation.get("num_workers"), stage2.get("num_workers"), 4))
     args.beta = float(first_existing(args.beta, stage2.get("beta"), stage1.get("beta_max"), 0.25))
+    args.use_m_local_diffusion = bool(first_existing(args.use_m_local_diffusion, stage2.get("use_m_local_diffusion"), stage1.get("use_m_local_diffusion"), False))
+    args.use_m_local_refine = bool(first_existing(args.use_m_local_refine, stage2.get("use_m_local_refine"), False))
+    args.m_local_dirs = first_existing(args.m_local_dirs, refine_paths.get("m_local_dirs"), baseline_paths.get("m_local_dirs"), [])
+    args.m_local_column = first_existing(args.m_local_column, stage2.get("m_local_column"), stage1.get("m_local_column"), "m_local")
+    args.m_local_lambda = float(first_existing(args.m_local_lambda, stage2.get("m_local_lambda"), stage1.get("m_local_lambda"), 0.5))
+    args.m_local_missing_policy = first_existing(args.m_local_missing_policy, stage2.get("m_local_missing_policy"), stage1.get("m_local_missing_policy"), "error")
     args.nafnet_width = int(first_existing(args.nafnet_width, stage2.get("nafnet_width"), 64))
     args.nafnet_middle_blk_num = int(first_existing(args.nafnet_middle_blk_num, stage2.get("nafnet_middle_blk_num"), 1))
     args.nafnet_enc_blk_nums = first_existing(args.nafnet_enc_blk_nums, stage2.get("nafnet_enc_blk_nums"), [1, 1, 1, 28])
@@ -155,6 +167,10 @@ def main() -> None:
         resolution_mode=args.resolution_mode,
         resize=args.resize,
         num_images=args.num_images,
+        load_m_local=args.use_m_local_diffusion or args.use_m_local_refine,
+        m_local_dirs=args.m_local_dirs,
+        m_local_column=args.m_local_column,
+        m_local_missing_policy=args.m_local_missing_policy,
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
@@ -177,11 +193,30 @@ def main() -> None:
             cond = batch["cond"].to(device)
             gt = batch["gt"].to(device)
             prior = batch["prior"].to(device)
-            prelim_pred = infer_diff_prelim(pipeline, cond, prior, args.prompt, args.beta)
+            m_local = batch.get("m_local")
+            if m_local is not None:
+                m_local = m_local.to(device)
+            prelim_pred = infer_diff_prelim(
+                pipeline,
+                cond,
+                prior,
+                args.prompt,
+                args.beta,
+                m_local_tensor=m_local if args.use_m_local_diffusion else None,
+                m_local_lambda=args.m_local_lambda,
+            )
             prelim = ((prelim_pred + 1.0) / 2.0).clamp(0.0, 1.0).float()
             cond = cond.float()
             prior = prior.float()
-            pred = apply_refine_residual(refine_net, refine_head, prelim, cond, prior, residual_scale=args.residual_scale)
+            pred = apply_refine_residual(
+                refine_net,
+                refine_head,
+                prelim,
+                cond,
+                prior,
+                m_local=m_local.float() if (args.use_m_local_refine and m_local is not None) else None,
+                residual_scale=args.residual_scale,
+            )
 
             metrics = calculate_validation_metrics(pred, gt, lpips_metric)
             batch_size = cond.shape[0]

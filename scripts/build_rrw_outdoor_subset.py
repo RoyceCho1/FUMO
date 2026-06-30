@@ -12,7 +12,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Build RRW outdoor subset for FUMO training.")
     parser.add_argument("--rrw_root", default="/home/student_1/LoViF/LOVIF_repo/data/RRW")
     parser.add_argument("--json_dir", default="/home/student_1/LoViF/FUMO/json/rrw_outdoor_50_qwen3")
-    parser.add_argument("--flat_lq_dir", default="/home/student_1/LoViF/FUMO/data/RRW_outdoor_50/LQ")
+    parser.add_argument("--flat_lq_dir", default="/home/student_1/LoViF/LOVIF_repo/data/RRW/outdoor_50/LQ")
+    parser.add_argument("--flat_gt_dir", default="/home/student_1/LoViF/LOVIF_repo/data/RRW/outdoor_50/GT")
     parser.add_argument("--prior_dir", default="/home/student_1/LoViF/FUMO/results/RRW_outdoor_50/Qwen3-VL-8B/P_int")
     parser.add_argument("--frames_per_scene", type=int, default=50)
     parser.add_argument("--prompt", default="remove degradation")
@@ -66,21 +67,24 @@ def main():
     rrw_root = Path(args.rrw_root)
     json_dir = Path(args.json_dir)
     flat_lq_dir = Path(args.flat_lq_dir)
+    flat_gt_dir = Path(args.flat_gt_dir)
     prior_dir = Path(args.prior_dir)
     json_dir.mkdir(parents=True, exist_ok=True)
     flat_lq_dir.mkdir(parents=True, exist_ok=True)
+    flat_gt_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
     summary = {
         "rrw_root": str(rrw_root),
         "frames_per_scene": args.frames_per_scene,
         "flat_lq_dir": str(flat_lq_dir),
+        "gt_dir": str(flat_gt_dir),
         "prior_dir": str(prior_dir),
         "scenes": [],
         "skipped_scenes": [],
     }
 
-    for group_dir in sorted(p for p in rrw_root.iterdir() if p.is_dir() and not p.name.startswith(".")):
+    for group_dir in sorted(p for p in rrw_root.iterdir() if p.is_dir() and not p.name.startswith(".") and p.name != "outdoor_50"):
         gt_dir = find_gt_dir(group_dir)
         if gt_dir is None:
             continue
@@ -99,6 +103,13 @@ def main():
             if not images:
                 summary["skipped_scenes"].append({"group": group_dir.name, "scene": scene_dir.name, "reason": "no images"})
                 continue
+            flat_gt_path = flat_gt_dir / f"{group_dir.name}__{scene_dir.name}_GT{gt_path.suffix}"
+            if flat_gt_path.exists() or flat_gt_path.is_symlink():
+                if args.overwrite_links:
+                    flat_gt_path.unlink()
+            if not flat_gt_path.exists():
+                os.symlink(gt_path, flat_gt_path)
+
             sampled = sample_evenly(images, args.frames_per_scene)
             scene_rows = 0
             for image_path in sampled:
@@ -111,7 +122,7 @@ def main():
                     os.symlink(image_path, flat_path)
                 rows.append({
                     "conditioning_image": str(flat_path),
-                    "image": str(gt_path),
+                    "image": str(flat_gt_path),
                     "prior": str(prior_dir / f"{flat_stem}.npy"),
                     "text": args.prompt,
                     "source": "RRW",
@@ -123,7 +134,8 @@ def main():
             summary["scenes"].append({
                 "group": group_dir.name,
                 "scene": scene_dir.name,
-                "gt": str(gt_path),
+                "original_gt": str(gt_path),
+                "gt": str(flat_gt_path),
                 "available_frames": len(images),
                 "sampled_frames": scene_rows,
             })
@@ -146,6 +158,7 @@ def main():
     print(f"Scenes: {len(summary['scenes'])}")
     print(f"Skipped scenes: {len(summary['skipped_scenes'])}")
     print(f"Flat LQ dir: {flat_lq_dir}")
+    print(f"Flat GT dir: {flat_gt_dir}")
     print(f"Expected P_int dir: {prior_dir}")
 
 

@@ -20,6 +20,7 @@ from transformers import AutoTokenizer, CLIPTextModel
 
 from diffusion.controlnetvae import ControlNetVAEModel
 from diffusion.pipeline_onestep import OneStepPipeline
+from fumo_mlocal import load_map_pil, resolve_m_local_path
 from wavelet_color_fix import wavelet_decomposition
 
 
@@ -168,6 +169,10 @@ class ValidationJsonlDataset(Dataset):
         resolution_mode: str = "square",
         resize: Tuple[int, int] | None = None,
         num_images: int | None = None,
+        load_m_local: bool = False,
+        m_local_dirs: List[str | Path] | None = None,
+        m_local_column: str = "m_local",
+        m_local_missing_policy: str = "error",
     ):
         if num_images is not None:
             entries = entries[: int(num_images)]
@@ -175,6 +180,10 @@ class ValidationJsonlDataset(Dataset):
         self.resolution = resolution
         self.resolution_mode = resolution_mode
         self.resize = tuple(resize) if resize is not None else None
+        self.load_m_local = load_m_local
+        self.m_local_dirs = m_local_dirs
+        self.m_local_column = m_local_column
+        self.m_local_missing_policy = m_local_missing_policy
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -184,6 +193,17 @@ class ValidationJsonlDataset(Dataset):
         cond = Image.open(item["conditioning_image"]).convert("RGB")
         gt = Image.open(item["image"]).convert("RGB")
         prior = TF.to_pil_image(load_prior_tensor(item["prior"]))
+        if self.load_m_local:
+            resolved_m_local_path = resolve_m_local_path(
+                item,
+                item["conditioning_image"],
+                self.m_local_dirs,
+                self.m_local_column,
+                self.m_local_missing_policy,
+            )
+            m_local = Image.new("L", cond.size, color=0) if resolved_m_local_path is None else load_map_pil(resolved_m_local_path)
+        else:
+            m_local = None
 
         if self.resolution_mode == "square":
             target_size = (self.resolution, self.resolution)
@@ -198,12 +218,17 @@ class ValidationJsonlDataset(Dataset):
             gt = gt.resize(target_size, Image.Resampling.BILINEAR)
         if prior.size != target_size:
             prior = prior.resize(target_size, Image.Resampling.LANCZOS)
+        if m_local is not None and m_local.size != target_size:
+            m_local = m_local.resize(target_size, Image.Resampling.LANCZOS)
 
-        return {
+        result = {
             "cond": TF.to_tensor(cond),
             "gt": TF.to_tensor(gt),
             "prior": TF.to_tensor(prior),
         }
+        if m_local is not None:
+            result["m_local"] = TF.to_tensor(m_local)
+        return result
 
 
 def load_pipeline(args, device: torch.device, dtype: torch.dtype) -> OneStepPipeline:
@@ -245,6 +270,8 @@ def infer_diff_prelim(
     prior_tensor: torch.Tensor,
     prompt: str,
     beta: float,
+    m_local_tensor: torch.Tensor | None = None,
+    m_local_lambda: float = 0.5,
 ) -> torch.Tensor:
     device = pipeline._execution_device
     dtype = pipeline.dtype
@@ -288,6 +315,10 @@ def infer_diff_prelim(
 
     prior = prior_tensor.to(device=device, dtype=dtype)
     prior = F.interpolate(prior, size=image.shape[-2:], mode="bilinear", align_corners=False)
+    if m_local_tensor is not None:
+        m_local = m_local_tensor.to(device=device, dtype=dtype)
+        m_local = F.interpolate(m_local, size=image.shape[-2:], mode="bilinear", align_corners=False)
+        prior = (prior + m_local_lambda * m_local).clamp(0.0, 1.0)
     hf_mag = compute_hf_mag(image)
 
     down_block_res_samples, mid_block_res_sample = pipeline.controlnet(
@@ -328,8 +359,17 @@ def infer_diff_prelim(
     )
 
 
-def build_refine_input(prelim: torch.Tensor, cond: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
-    return torch.cat([prelim, compute_hf_image(cond), prior, cond], dim=1)
+def build_refine_input(
+    prelim: torch.Tensor,
+    cond: torch.Tensor,
+    prior: torch.Tensor,
+    m_local: torch.Tensor | None = None,
+) -> torch.Tensor:
+    parts = [prelim, compute_hf_image(cond), prior]
+    if m_local is not None:
+        parts.append(m_local)
+    parts.append(cond)
+    return torch.cat(parts, dim=1)
 
 
 def apply_refine_residual(
@@ -338,15 +378,16 @@ def apply_refine_residual(
     prelim: torch.Tensor,
     cond: torch.Tensor,
     prior: torch.Tensor,
+    m_local: torch.Tensor | None = None,
     residual_scale: float = 0.1,
 ) -> torch.Tensor:
-    feat = refine_net(build_refine_input(prelim, cond, prior))
+    feat = refine_net(build_refine_input(prelim, cond, prior, m_local))
     residual = torch.tanh(refine_head(feat)) * residual_scale
     return (prelim + residual).clamp(0.0, 1.0)
 
 
 def load_refine_models(args, net_path: Path, head_path: Path, device: torch.device):
-    in_ch = 10
+    in_ch = 10 + int(getattr(args, "use_m_local_refine", False))
     refine_net = NAFNet(
         img_channel=in_ch,
         width=args.nafnet_width,
@@ -355,8 +396,14 @@ def load_refine_models(args, net_path: Path, head_path: Path, device: torch.devi
         dec_blk_nums=args.nafnet_dec_blk_nums,
     ).to(device)
     refine_head = torch.nn.Conv2d(in_ch, 3, kernel_size=1, bias=True).to(device)
-    refine_net.load_state_dict(torch.load(net_path, map_location="cpu"))
-    refine_head.load_state_dict(torch.load(head_path, map_location="cpu"))
+    try:
+        refine_net.load_state_dict(torch.load(net_path, map_location="cpu"))
+        refine_head.load_state_dict(torch.load(head_path, map_location="cpu"))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load refine checkpoint with in_ch={in_ch}. "
+            "Check that use_m_local_refine matches the checkpoint (10ch off, 11ch on)."
+        ) from exc
     refine_net.eval()
     refine_head.eval()
     return refine_net, refine_head
@@ -364,7 +411,7 @@ def load_refine_models(args, net_path: Path, head_path: Path, device: torch.devi
 
 def find_latest_refine_dir(outputs_dir: Path) -> Path | None:
     candidates = []
-    for run_dir in outputs_dir.glob("refine_baseline_*"):
+    for run_dir in outputs_dir.glob("refine_*"):
         best = run_dir / "best"
         if (best / "nafnet_refine.pth").exists() and (best / "nafnet_refine_head.pth").exists():
             candidates.append(run_dir)
