@@ -1,18 +1,15 @@
 experiment:
-  name: refine_outdoor_50_m_local
+  name: refine_constant_ema
   prompt: remove degradation
 
 paths:
-  json_dir: /home/student_1/LoViF/FUMO/json/lovif_qwen25_rrw_outdoor_50
-  train_jsonl: train.jsonl
-  validation_jsonl: /home/student_1/LoViF/FUMO/json/lovif_qwen25_rrw_outdoor_50/baseline_val.jsonl
+  json_dir: /home/student_1/LoViF/FUMO/json
+  train_jsonl: baseline_train.jsonl
+  validation_jsonl: /home/student_1/LoViF/FUMO/json/baseline_val.jsonl
   output_dir: /home/student_1/LoViF/FUMO/outputs
-  m_local_dirs:
-    - /home/student_1/LoViF/MaxRF/results/RRW/m_local
-    - /home/student_1/LoViF/MaxRF/results/LQ_RaindropRemoval_WeatherRemoval_train/m_local
   pretrained_model_name_or_path: Manojb/stable-diffusion-2-1-base
-  controlnet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_rrw_outdoor_50_m_local_20260629_170118/best/controlnet
-  unet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_rrw_outdoor_50_m_local_20260629_170118/best/unet
+  controlnet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_lovif_constant_ema_20260630_205121/best/controlnet
+  unet_dir: /home/student_1/LoViF/FUMO/outputs/baseline_lovif_constant_ema_20260630_205121/best/unet
 
 stage2:
   multiple_datasets_probabilities: [1.0]
@@ -35,6 +32,8 @@ stage2:
   num_workers: 4
   mixed_precision: bf16
   report_to: none
+  use_ema: true
+  ema_decay: 0.999
   l1_weight: 0.5
   lpips_weight: 0.25
   grad_weight: 0.25
@@ -43,8 +42,8 @@ stage2:
   nafnet_enc_blk_nums: [1, 1, 1, 28]
   nafnet_dec_blk_nums: [1, 1, 1, 1]
   beta: 0.25
-  use_m_local_diffusion: true
-  use_m_local_refine: true
+  use_m_local_diffusion: false
+  use_m_local_refine: false
   m_local_lambda: 0.5
   m_local_missing_policy: error
   seed: 42

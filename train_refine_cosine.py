@@ -494,6 +494,15 @@ class JsonlDataset(Dataset):
                 if m_local is not None:
                     m_local = TF.vflip(m_local)
 
+            rotate_k = random.randint(0, 3)
+            if rotate_k:
+                angle = 90 * rotate_k
+                cond = cond.rotate(angle, expand=False)
+                gt = gt.rotate(angle, expand=False)
+                prior = prior.rotate(angle, expand=False)
+                if m_local is not None:
+                    m_local = m_local.rotate(angle, expand=False)
+
         cond = TF.to_tensor(cond)  # [0,1]
         gt = TF.to_tensor(gt)      # [0,1]
         prior = TF.to_tensor(prior)  # [1,H,W]
